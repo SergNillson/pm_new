@@ -84,11 +84,11 @@ logger = logging.getLogger(__name__)
 # Constants / defaults
 # ---------------------------------------------------------------------------
 DEFAULT_CAPITAL = 38.0
-DEFAULT_MIN_GAP = 15.0
+DEFAULT_MIN_GAP = 25.0
 DEFAULT_MAX_VOL = 0.15
 DEFAULT_BASE_SIZE = 0.05
 ENTRY_WINDOW_LOW = 15   # seconds before settlement
-ENTRY_WINDOW_HIGH = 25  # seconds before settlement
+ENTRY_WINDOW_HIGH = 90  # seconds before settlement (extended for momentum+gap strategy)
 SCAN_INTERVAL = 1       # seconds between market scans
 PARTIAL_EXIT_THRESHOLD = 0.40   # 40 % gap erosion → sell 50 %
 EMERGENCY_EXIT_THRESHOLD = 0.70  # 70 % gap erosion → full exit
@@ -104,6 +104,11 @@ PARTIAL_EXIT_PRICE = 0.50        # Mid-market price used for partial-exit sells
 # Dry-run simulation parameters
 SIMULATED_BTC_BASE_PRICE = 65_000.0
 SIMULATED_BTC_RANGE = 500.0
+
+# Simulated Up/Down token prices used in dry-run when the implied gap is significant
+_DRY_RUN_UP_PRICE = 0.80       # Simulated confident-side token price (high certainty)
+_DRY_RUN_DOWN_PRICE = 0.20     # Simulated opposing-side token price
+_DRY_RUN_UP_GAP_THRESHOLD = 0  # Any positive/negative gap triggers the simulation
 
 
 # ===========================================================================
@@ -639,47 +644,175 @@ class GapCertaintyStrategy:
         btc_price: float,
         volatility: float,
     ) -> None:
-        """Evaluate one market for a trading signal."""
-        market_id = market["id"]
-        time_left = int(market["settlement_time"] - time.time())
+        """Evaluate market for a Momentum + Gap trading signal."""
+        market_id = market.get("condition_id", market.get("id", ""))
+        time_left_seconds = int(market["settlement_time"] - time.time())
 
-        gap = self.gap_analyzer.get_current_gap(market_id, btc_price, market_data=market)
+        # Seed reference price on first observation for Up/Down markets that
+        # lack an explicit strike.  Synthetic dry-run markets already carry a
+        # strike, so we skip seeding to preserve that reference.
+        if not market.get("strike"):
+            self.gap_analyzer.seed_reference_price(market, btc_price)
 
-        if abs(gap) < self.min_gap:
-            logger.debug("Gap %.2f < %.2f — no signal for %s", gap, self.min_gap, market_id)
-            return
-
-        # Multi-timeframe alignment (best-effort; skipped in dry-run)
-        require_mtf = self.config.get("entry", {}).get("require_multi_timeframe", True)
-        if require_mtf:
-            aligned = self.gap_analyzer.check_multi_timeframe_alignment(gap)
-            if not aligned:
-                logger.debug("Multi-TF misaligned — skipping %s", market_id)
-                return
-
-        ref_price = market.get("strike")
-        if ref_price is not None:
-            logger.info(
-                "🎯 SIGNAL detected | market=%s | ref=$%.2f | btc=$%.2f | gap=$%.2f | vol=%.1f%% | %ds left",
-                market_id,
-                ref_price,
-                btc_price,
-                gap,
-                volatility * 100,
-                time_left,
-            )
+        # Get Up/Down token prices from orderbook
+        if self.paper_trading and self.paper_engine is not None:
+            token_prices = await self.paper_engine.get_token_prices(market)
         else:
-            logger.info(
-                "🎯 SIGNAL detected | market=%s | btc=$%.2f | gap=$%.2f | vol=%.1f%% | %ds left",
-                market_id,
-                btc_price,
-                gap,
-                volatility * 100,
-                time_left,
-            )
+            # In dry-run / live mode: derive implied prices from the gap.
+            # Using named constants avoids magic numbers in the simulation.
+            ref = self.gap_analyzer.get_reference_price_for_window(market)
+            if ref is None:
+                # Fall back to explicit strike (synthetic / legacy markets)
+                try:
+                    ref = float(market["strike"]) if market.get("strike") else btc_price
+                except (TypeError, ValueError):
+                    ref = btc_price
+            implied_gap = btc_price - ref
+            if implied_gap > _DRY_RUN_UP_GAP_THRESHOLD:
+                token_prices = {"up": _DRY_RUN_UP_PRICE, "down": _DRY_RUN_DOWN_PRICE}
+            elif implied_gap < -_DRY_RUN_UP_GAP_THRESHOLD:
+                token_prices = {"up": _DRY_RUN_DOWN_PRICE, "down": _DRY_RUN_UP_PRICE}
+            else:
+                token_prices = {"up": 0.50, "down": 0.50}
 
-        size = self.sizer.calculate_size(gap, volatility, time_left)
-        await self._enter_position(market, gap, size)
+        up_price = token_prices.get("up", 0.5)
+        down_price = token_prices.get("down", 0.5)
+
+        logger.debug(
+            "Market %s... | Time left: %ds | Up: %.3f Down: %.3f",
+            market.get("question", market_id)[:50],
+            time_left_seconds,
+            up_price,
+            down_price,
+        )
+
+        # Check Momentum + Gap signal
+        signal = self.gap_analyzer.check_momentum_gap_signal(
+            market_data=market,
+            current_btc_price=btc_price,
+            up_token_price=up_price,
+            down_token_price=down_price,
+            min_token_price_threshold=self.config.get("entry", {}).get("min_token_price", 0.75),
+            min_gap=self.min_gap,
+            max_time_left=self.config.get("entry", {}).get("max_time_left", ENTRY_WINDOW_HIGH),
+            min_time_left=self.config.get("entry", {}).get("min_time_left", ENTRY_WINDOW_LOW),
+        )
+
+        if signal is None:
+            return  # No signal
+
+        logger.info(
+            "🎯 MOMENTUM+GAP SIGNAL | "
+            "Side: %s | "
+            "Confidence: %.1f%% | "
+            "Gap: $%+.2f | "
+            "Entry price: %.3f | "
+            "Time left: %.0fs | "
+            "Expected profit: %.1f%%",
+            signal["side"],
+            signal["confidence"] * 100,
+            signal["gap"],
+            signal["entry_price"],
+            signal["time_left"],
+            signal["expected_profit_pct"],
+        )
+
+        # Calculate position size (using gap as signal strength)
+        size = self.sizer.calculate_size(
+            signal["gap"],
+            volatility,
+            signal["time_left"],
+        )
+
+        # Enter position
+        await self._enter_position_momentum(market, signal, size)
+
+    async def _enter_position_momentum(
+        self,
+        market: Dict[str, Any],
+        signal: Dict[str, Any],
+        size: float,
+    ) -> None:
+        """
+        Enter a position based on a Momentum + Gap signal.
+
+        Args:
+            market: Market data dict.
+            signal: Signal dict from ``check_momentum_gap_signal()``.
+            size:   Position size in USD.
+        """
+        side = signal["side"]
+        entry_price = signal["entry_price"]
+        gap = signal["gap"]
+
+        logger.info(
+            "📈 ENTERING %s POSITION | size=$%.2f (%.1f%%) | price=%.3f | gap=$%+.2f",
+            side,
+            size,
+            (size / self.sizer.bankroll) * 100,
+            entry_price,
+            gap,
+        )
+
+        token = self._get_token_id_for_side(market, side)
+
+        if self.paper_trading and self.paper_engine is not None:
+            order = await self.paper_engine.place_paper_order(
+                market=market.get("_raw", market),
+                side=side,
+                size_usd=size,
+            )
+            if order is None:
+                logger.warning("⚠️  Paper order placement failed — skipping monitor.")
+                return
+            token = order.get("token_id", token)
+        else:
+            await self.executor.place_order(side, token, entry_price, size, gap=gap)
+
+        await self._monitor_position(market, token, gap, size)
+
+    def _get_token_id_for_side(
+        self,
+        market: Dict[str, Any],
+        side: str,
+    ) -> str:
+        """
+        Get token ID for the given side ("UP" or "DOWN").
+
+        Args:
+            market: Market data dict with ``tokens`` and ``outcomes`` fields.
+            side:   "UP" or "DOWN".
+
+        Returns:
+            Token ID string.
+        """
+        tokens: List[Dict] = market.get("tokens", [])
+        outcomes = market.get("outcomes", [])
+
+        if not tokens:
+            return market.get("condition_id", market.get("id", ""))
+
+        # Match by outcome label
+        for i, tok in enumerate(tokens):
+            if isinstance(tok, dict):
+                outcome = tok.get("outcome", "")
+                token_id = tok.get("token_id", "")
+            else:
+                outcome = outcomes[i] if i < len(outcomes) else ""
+                token_id = str(tok)
+
+            outcome_upper = str(outcome).upper()
+            if side == "UP" and outcome_upper in ("UP", "YES", "HIGHER"):
+                return token_id
+            if side == "DOWN" and outcome_upper in ("DOWN", "NO", "LOWER"):
+                return token_id
+
+        # Fallback: assume first = Up, second = Down
+        first = tokens[0]
+        second = tokens[1] if len(tokens) > 1 else tokens[0]
+        if side == "UP":
+            return first.get("token_id", str(first)) if isinstance(first, dict) else str(first)
+        return second.get("token_id", str(second)) if isinstance(second, dict) else str(second)
 
     async def _enter_position(
         self,
