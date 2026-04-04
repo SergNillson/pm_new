@@ -100,17 +100,264 @@ SIMULATED_BTC_RANGE = 500.0
 
 
 # ===========================================================================
+# Realistic market simulator (dry-run)
+# ===========================================================================
+class RealisticMarketSimulator:
+    """
+    Simulates realistic market conditions for dry-run mode.
+    Adds slippage, fees, front-running, latency, and partial fills.
+    """
+
+    def __init__(self) -> None:
+        self.total_slippage = 0.0
+        self.total_gas_fees = 0.0
+        self.total_latency_losses = 0.0
+        self.total_front_running_losses = 0.0
+        self.partial_fill_count = 0
+
+    def calculate_slippage(self, position_size: float, target_price: float) -> tuple:
+        """
+        Calculate realistic slippage based on position size and orderbook depth.
+
+        Returns: (actual_fill_price, slippage_amount)
+        """
+        import random  # noqa: PLC0415
+
+        # Base slippage increases with position size
+        if position_size < 2.0:
+            base_slippage = 0.001  # 0.1%
+        elif position_size < 4.0:
+            base_slippage = 0.003  # 0.3%
+        elif position_size < 6.0:
+            base_slippage = 0.006  # 0.6%
+        else:
+            base_slippage = 0.010  # 1.0%
+
+        # Add random variation (±30%)
+        actual_slippage = base_slippage * random.uniform(0.7, 1.3)
+
+        # Worse slippage for YES (buying) than NO (selling)
+        # Because we're taking liquidity
+        actual_fill_price = target_price * (1 - actual_slippage)
+        slippage_cost = position_size * actual_slippage
+
+        self.total_slippage += slippage_cost
+
+        logger.debug(
+            "Slippage simulation: target=%.4f, actual=%.4f, cost=$%.4f",
+            target_price,
+            actual_fill_price,
+            slippage_cost,
+        )
+
+        return actual_fill_price, slippage_cost
+
+    def calculate_realistic_fees(self, position_size: float) -> float:
+        """
+        Calculate realistic fees including gas.
+
+        Returns: total_fees
+        """
+        import random  # noqa: PLC0415
+
+        # Trading fee (0.2%)
+        trading_fee = position_size * 0.002
+
+        # Gas fee on Polygon (variable)
+        gas_fee = random.uniform(0.01, 0.05)
+
+        total_fees = trading_fee + gas_fee
+        self.total_gas_fees += gas_fee
+
+        return total_fees
+
+    def simulate_front_running(self, gap: float, entry_price: float) -> tuple:
+        """
+        Simulate front-running by bots who see the same signal.
+        Larger gaps = more competition = worse prices.
+
+        Returns: (adjusted_price, front_running_cost)
+        """
+        import random  # noqa: PLC0415
+
+        abs_gap = abs(gap)
+
+        if abs_gap >= 30:
+            # Huge gap = many bots competing
+            price_impact = random.uniform(0.015, 0.025)  # 1.5-2.5% worse
+        elif abs_gap >= 20:
+            price_impact = random.uniform(0.008, 0.015)  # 0.8-1.5% worse
+        elif abs_gap >= 15:
+            price_impact = random.uniform(0.003, 0.008)  # 0.3-0.8% worse
+        else:
+            price_impact = random.uniform(0.001, 0.003)  # 0.1-0.3% worse
+
+        # Adjust entry price (worse for buyer)
+        adjusted_price = entry_price * (1 + price_impact)
+
+        # Clamp to [0.01, 0.99]
+        adjusted_price = max(0.01, min(0.99, adjusted_price))
+
+        cost = price_impact * entry_price
+        self.total_front_running_losses += cost
+
+        logger.debug(
+            "Front-running simulation: gap=$%.2f, price %.4f → %.4f (impact: %.2f%%)",
+            gap,
+            entry_price,
+            adjusted_price,
+            price_impact * 100,
+        )
+
+        return adjusted_price, cost
+
+    def simulate_latency_loss(self, gap: float) -> tuple:
+        """
+        Simulate trade execution latency (2-5 seconds).
+        During this time, BTC can move and gap can disappear.
+
+        Returns: (trade_cancelled, loss_if_cancelled)
+        """
+        import random  # noqa: PLC0415
+
+        # Latency: 2-5.5 seconds
+        latency_seconds = random.uniform(2.0, 5.5)
+
+        # BTC can move ~$10-30 per second in high volatility
+        # Assume moderate volatility: $5-15 per second
+        btc_movement = random.uniform(5, 15) * latency_seconds
+
+        # Gap erosion during latency; clamp to [0, 1] to avoid unrealistic values
+        # when gap is very small
+        gap_erosion_pct = min(btc_movement / abs(gap), 1.0) if gap != 0 else 0
+
+        # If gap erodes >60% during latency, cancel trade
+        if gap_erosion_pct > 0.60:
+            logger.debug(
+                "Latency simulation: gap eroded %.1f%% during %.1fs → TRADE CANCELLED",
+                gap_erosion_pct * 100,
+                latency_seconds,
+            )
+            self.total_latency_losses += abs(gap) * 0.05  # Small opportunity cost
+            return True, abs(gap) * 0.05
+
+        return False, 0.0
+
+    def simulate_partial_fill(self, position_size: float) -> tuple:
+        """
+        Simulate partial fills due to thin orderbooks near settlement.
+        ~15% of trades only partially filled.
+
+        Returns: (actual_filled_size, was_partial)
+        """
+        import random  # noqa: PLC0415
+
+        # 15% chance of partial fill
+        if random.random() < 0.15:
+            # Fill only 40-80% of desired size
+            fill_ratio = random.uniform(0.40, 0.80)
+            actual_size = position_size * fill_ratio
+            self.partial_fill_count += 1
+
+            logger.debug(
+                "Partial fill simulation: requested $%.2f, filled $%.2f (%.0f%%)",
+                position_size,
+                actual_size,
+                fill_ratio * 100,
+            )
+
+            return actual_size, True
+
+        return position_size, False
+
+    def simulate_settlement_uncertainty(self, entry_gap: float, side: str) -> bool:
+        """
+        Simulate settlement outcome with realistic win rate.
+        BTC is volatile - can reverse in final 10-20 seconds.
+
+        Real win rates:
+        - Gap $30+:  92%
+        - Gap $20-30: 88%
+        - Gap $15-20: 85%
+        - Gap <$15:  80%
+
+        Returns: True if won, False if lost
+        """
+        import random  # noqa: PLC0415
+
+        abs_gap = abs(entry_gap)
+
+        # Determine win probability based on gap size
+        if abs_gap >= 30:
+            win_probability = 0.92
+        elif abs_gap >= 20:
+            win_probability = 0.88
+        elif abs_gap >= 15:
+            win_probability = 0.85
+        else:
+            win_probability = 0.80
+
+        # Roll the dice
+        won = random.random() < win_probability
+
+        # Determine final gap direction
+        if won:
+            # Gap held direction
+            final_gap_direction_up = entry_gap > 0
+        else:
+            # Gap reversed!
+            final_gap_direction_up = entry_gap < 0
+            logger.info(
+                "💥 Gap reversed during settlement! Entry gap=$%.2f, reversed to %s",
+                entry_gap,
+                "UP" if final_gap_direction_up else "DOWN",
+            )
+
+        # Check if our side matches final direction
+        result = (side == "YES" and final_gap_direction_up) or (
+            side == "NO" and not final_gap_direction_up
+        )
+
+        return result
+
+    def get_summary(self) -> dict:
+        """Return summary of realistic market impacts."""
+        return {
+            "total_slippage": self.total_slippage,
+            "total_gas_fees": self.total_gas_fees,
+            "total_latency_losses": self.total_latency_losses,
+            "total_front_running_losses": self.total_front_running_losses,
+            "partial_fill_count": self.partial_fill_count,
+            "total_realistic_costs": (
+                self.total_slippage
+                + self.total_gas_fees
+                + self.total_latency_losses
+                + self.total_front_running_losses
+            ),
+        }
+
+
+# ===========================================================================
 # Simulated order executor (dry-run)
 # ===========================================================================
 class SimulatedOrderExecutor:
     """
-    Simulates order placement and settlement without touching real APIs.
-    All P&L is hypothetical.
+    Simulates order placement and settlement with REALISTIC market conditions.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, enable_realism: bool = True) -> None:
         self.positions: Dict[str, Dict[str, Any]] = {}
         self.trade_history: List[Dict[str, Any]] = []
+        self.enable_realism = enable_realism
+
+        if enable_realism:
+            self.market_sim: Optional[RealisticMarketSimulator] = RealisticMarketSimulator()
+            logger.info(
+                "📊 Realistic market simulation ENABLED (slippage, fees, latency, front-running)"
+            )
+        else:
+            self.market_sim = None
+            logger.info("📊 Realistic market simulation DISABLED (perfect fills)")
 
     async def place_order(
         self,
@@ -118,17 +365,56 @@ class SimulatedOrderExecutor:
         token: str,
         price: float,
         size: float,
+        gap: float = 0.0,
     ) -> Dict[str, Any]:
-        """Record a simulated order."""
+        """Record a simulated order with realistic market conditions."""
+        original_price = price
+        original_size = size
+        actual_price = price
+        actual_size = size
+
+        if self.enable_realism and self.market_sim:
+            # 1. Simulate latency (might cancel trade)
+            cancelled, _latency_loss = self.market_sim.simulate_latency_loss(gap)
+            if cancelled:
+                logger.warning("⏱️  Trade CANCELLED due to latency (gap eroded)")
+                return {"cancelled": True, "reason": "latency"}
+
+            # 2. Simulate front-running (price moves before we fill)
+            if abs(gap) >= 15:  # Only on signals we'd actually take
+                actual_price, _fr_cost = self.market_sim.simulate_front_running(gap, actual_price)
+
+            # 3. Simulate slippage
+            actual_price, _slippage_cost = self.market_sim.calculate_slippage(size, actual_price)
+
+            # 4. Simulate partial fills
+            actual_size, was_partial = self.market_sim.simulate_partial_fill(size)
+            if was_partial:
+                logger.info(
+                    "⚠️  Partial fill: requested $%.2f, filled $%.2f",
+                    original_size,
+                    actual_size,
+                )
+
         order: Dict[str, Any] = {
             "side": side,
             "token": token,
-            "price": price,
-            "size": size,
+            "requested_price": original_price,
+            "actual_price": actual_price,
+            "requested_size": original_size,
+            "actual_size": actual_size,
             "timestamp": time.time(),
+            "gap": gap,
         }
         self.positions[token] = order
-        logger.info("[DRY-RUN] Simulated %s order: size=%.2f @ price=%.4f", side, size, price)
+
+        logger.info(
+            "[DRY-RUN] Simulated %s order: size=%.2f @ price=%.4f %s",
+            side,
+            actual_size,
+            actual_price,
+            "(REALISTIC)" if self.enable_realism else "",
+        )
         return order
 
     async def settle_position(
@@ -136,26 +422,42 @@ class SimulatedOrderExecutor:
         token: str,
         settlement_price: float,
         gap_direction_up: bool,
+        entry_gap: float = 0.0,
     ) -> float:
-        """Simulate settlement and return P&L."""
+        """Simulate settlement with REALISTIC win rate."""
         position = self.positions.pop(token, None)
         if position is None:
             return 0.0
 
         # On Polymarket binary markets a "YES" bet at price p pays (1-p) if wins
         # and loses p if wrong.
-        entry_price = position["price"]
-        size = position["size"]
+        entry_price = position["actual_price"]  # Use actual fill price (with slippage)
+        size = position["actual_size"]  # Use actual filled size (might be partial)
         side = position["side"]
 
-        won = (side == "YES" and gap_direction_up) or (
-            side == "NO" and not gap_direction_up
-        )
-
-        if won:
-            pnl = size * (1.0 - entry_price)
+        # Determine if trade won
+        if self.enable_realism and self.market_sim:
+            # Realistic settlement (accounts for reversals)
+            won = self.market_sim.simulate_settlement_uncertainty(entry_gap, side)
         else:
-            pnl = -size * entry_price
+            # Perfect settlement (old behaviour)
+            won = (side == "YES" and gap_direction_up) or (
+                side == "NO" and not gap_direction_up
+            )
+
+        # Calculate P&L
+        if won:
+            gross_pnl = size * (1.0 - entry_price)
+        else:
+            gross_pnl = -size * entry_price
+
+        # Subtract realistic fees
+        if self.enable_realism and self.market_sim:
+            fees = self.market_sim.calculate_realistic_fees(size)
+            net_pnl = gross_pnl - fees
+        else:
+            fees = size * 0.002  # Original 0.2% only
+            net_pnl = gross_pnl - fees
 
         record = {
             "token": token,
@@ -163,13 +465,23 @@ class SimulatedOrderExecutor:
             "entry_price": entry_price,
             "settlement_price": settlement_price,
             "size": size,
-            "pnl": pnl,
+            "gross_pnl": gross_pnl,
+            "fees": fees,
+            "pnl": net_pnl,
             "won": won,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self.trade_history.append(record)
-        logger.info("[DRY-RUN] Settled %s | P&L=%+.2f (%s)", token, pnl, "WIN ✅" if won else "LOSS ❌")
-        return pnl
+
+        logger.info(
+            "[DRY-RUN] Settled %s | Gross P&L=%+.2f | Fees=-%.2f | Net P&L=%+.2f (%s)",
+            token,
+            gross_pnl,
+            fees,
+            net_pnl,
+            "WIN ✅" if won else "LOSS ❌",
+        )
+        return net_pnl
 
 
 # ===========================================================================
@@ -194,6 +506,7 @@ class GapCertaintyStrategy:
         base_size: float = DEFAULT_BASE_SIZE,
         dry_run: bool = True,
         config: Optional[Dict[str, Any]] = None,
+        enable_realism: bool = True,
     ) -> None:
         self.capital = capital
         self.min_gap = min_gap
@@ -208,7 +521,7 @@ class GapCertaintyStrategy:
         self.sizer = AdaptivePositionSizer(capital=capital, base_pct=base_size)
 
         if dry_run:
-            self.executor: Any = SimulatedOrderExecutor()
+            self.executor: Any = SimulatedOrderExecutor(enable_realism=enable_realism)
         else:
             self.executor = self._build_live_executor(clob_client)
 
@@ -354,14 +667,15 @@ class GapCertaintyStrategy:
         price = HIGH_CERTAINTY_PRICE if abs(gap) >= 20 else MODERATE_CERTAINTY_PRICE
 
         logger.info(
-            "📈 Entering position | side=%s | size=$%.2f (%.1f%%) | price=%.2f",
+            "📈 Entering position | side=%s | size=$%.2f (%.1f%%) | price=%.2f | gap=$%.2f",
             side,
             size,
             (size / self.sizer.bankroll) * 100,
             price,
+            gap,
         )
 
-        await self.executor.place_order(side, token, price, size)
+        await self.executor.place_order(side, token, price, size, gap=gap)
         await self._monitor_position(market, token, gap, size)
 
     # ------------------------------------------------------------------
@@ -436,7 +750,7 @@ class GapCertaintyStrategy:
         final_gap = self.gap_analyzer.get_current_gap(market_id, btc_price, market_data=market)
         gap_direction_up = final_gap > 0
 
-        pnl = await self.executor.settle_position(token, btc_price, gap_direction_up)
+        pnl = await self.executor.settle_position(token, btc_price, gap_direction_up, entry_gap=entry_gap)
         won = pnl >= 0
 
         self.sizer.update_after_trade(pnl, won)
@@ -637,6 +951,24 @@ class GapCertaintyStrategy:
         logger.info("  Total P&L:      %+.2f", self.sizer.total_pnl)
         logger.info("  Final bankroll: %.2f (started %.2f)", self.sizer.bankroll, self.capital)
         logger.info("  Drawdown:       %.1f%%", self.sizer.drawdown_pct * 100)
+
+        # Add realistic simulation summary
+        if self.dry_run and hasattr(self.executor, "market_sim") and self.executor.market_sim:
+            sim_summary = self.executor.market_sim.get_summary()
+            logger.info("=" * 60)
+            logger.info("  Realistic Market Impact Summary")
+            logger.info("  Total slippage:         -$%.2f", sim_summary["total_slippage"])
+            logger.info("  Total gas fees:         -$%.2f", sim_summary["total_gas_fees"])
+            logger.info("  Front-running losses:   -$%.2f", sim_summary["total_front_running_losses"])
+            logger.info("  Latency losses:         -$%.2f", sim_summary["total_latency_losses"])
+            logger.info("  Partial fills:          %d trades", sim_summary["partial_fill_count"])
+            logger.info("  TOTAL REALISTIC COSTS:  -$%.2f", sim_summary["total_realistic_costs"])
+            logger.info("  ")
+            logger.info(
+                "  P&L after realistic costs: %+.2f",
+                self.sizer.total_pnl - sim_summary["total_realistic_costs"],
+            )
+
         logger.info("=" * 60)
 
 
@@ -780,6 +1112,12 @@ def parse_args() -> argparse.Namespace:
         metavar="PATH",
         help="Path to optional YAML config file.",
     )
+    parser.add_argument(
+        "--disable-realism",
+        action="store_true",
+        default=False,
+        help="Disable realistic market simulation in dry-run (perfect fills, perfect win rate).",
+    )
 
     return parser.parse_args()
 
@@ -805,6 +1143,7 @@ def main() -> None:
         base_size=base_size,
         dry_run=not live_mode,
         config=config,
+        enable_realism=not args.disable_realism,
     )
 
     asyncio.run(strategy.run())
