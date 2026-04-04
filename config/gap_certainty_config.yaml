@@ -1,0 +1,55 @@
+# Gap Certainty Strategy Configuration
+
+strategy:
+  name: "Gap-Based High Certainty Scalping"
+  version: "1.0.0"
+
+capital:
+  initial: 38.0
+  min_balance: 10.0
+
+# Entry Filters
+entry:
+  min_gap: 15.0
+  max_volatility: 0.15
+  min_time_left: 15
+  max_time_left: 25
+  require_multi_timeframe: true
+
+# Position Sizing (Adaptive)
+sizing:
+  base_percentage: 0.05
+  min_percentage: 0.02
+  max_percentage: 0.12
+
+  gap_multipliers:
+    15: 1.2
+    20: 1.5
+    25: 1.8
+
+  volatility_multipliers:
+    0.10: 1.3
+    0.15: 1.1
+    0.20: 1.0
+
+# Risk Management
+risk:
+  max_consecutive_losses: 3
+  pause_duration_minutes: 60
+  partial_exit_threshold: 0.40
+  emergency_exit_threshold: 0.70
+  max_daily_drawdown: 0.15
+
+# Markets
+markets:
+  assets:
+    - "BTC"
+  timeframes:
+    - "5min"
+
+# Logging
+logging:
+  level: "INFO"
+  file: "logs/gap_certainty.log"
+  csv_export: true
+  csv_file: "logs/trades.csv"
