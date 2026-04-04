@@ -10,11 +10,12 @@ capital:
 
 # Entry Filters
 entry:
-  min_gap: 15.0
-  max_volatility: 0.15
-  min_time_left: 15
-  max_time_left: 25
-  require_multi_timeframe: true
+  min_gap: 25.0                    # Minimum gap in USD (was 15.0)
+  min_token_price: 0.75            # Minimum Up/Down token price for entry (new)
+  max_volatility: 0.15             # Maximum volatility
+  min_time_left: 15                # Minimum seconds until settlement
+  max_time_left: 90                # Maximum seconds until settlement (was 25)
+  require_multi_timeframe: false   # Disabled for Up/Down markets
 
 # Position Sizing (Adaptive)
 sizing:

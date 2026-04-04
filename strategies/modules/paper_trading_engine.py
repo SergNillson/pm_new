@@ -321,6 +321,77 @@ class PaperTradingEngine:
             summary["total_pnl"],
         )
 
+    async def get_token_prices(self, market: Dict[str, Any]) -> Dict[str, float]:
+        """
+        Fetch current Up and Down token prices from the Polymarket CLOB orderbook.
+
+        Args:
+            market: Market dict with a ``"tokens"`` list.
+
+        Returns:
+            ``{"up": float, "down": float}`` — prices in [0, 1].
+            Falls back to ``{"up": 0.5, "down": 0.5}`` if prices cannot be fetched.
+        """
+        default = {"up": 0.5, "down": 0.5}
+        tokens: List[Dict] = market.get("tokens", [])
+        outcomes = market.get("outcomes", [])
+
+        if not tokens:
+            logger.debug("get_token_prices: no tokens in market")
+            return default
+
+        # Build a mapping from outcome label → token_id
+        outcome_to_token: Dict[str, str] = {}
+        for i, tok in enumerate(tokens):
+            # tokens may be plain strings (token IDs) or dicts with "token_id"/"outcome"
+            if isinstance(tok, dict):
+                token_id = tok.get("token_id", "")
+                outcome = tok.get("outcome", "")
+            else:
+                token_id = str(tok)
+                outcome = outcomes[i] if i < len(outcomes) else ""
+            outcome_to_token[outcome.upper()] = token_id
+
+        # Resolve Up and Down token IDs
+        up_token_id: Optional[str] = None
+        down_token_id: Optional[str] = None
+        for label, token_id in outcome_to_token.items():
+            if label in ("UP", "YES", "HIGHER"):
+                up_token_id = token_id
+            elif label in ("DOWN", "NO", "LOWER"):
+                down_token_id = token_id
+
+        # Fallback: if labels aren't matched, assume first=Up, second=Down
+        if up_token_id is None and len(tokens) >= 1:
+            tok = tokens[0]
+            up_token_id = tok.get("token_id") if isinstance(tok, dict) else str(tok)
+        if down_token_id is None and len(tokens) >= 2:
+            tok = tokens[1]
+            down_token_id = tok.get("token_id") if isinstance(tok, dict) else str(tok)
+
+        # Fetch midpoint prices concurrently
+        up_price: float = 0.5
+        down_price: float = 0.5
+        try:
+            up_mid, down_mid = await asyncio.gather(
+                self.api_client.fetch_midpoint(up_token_id) if up_token_id else asyncio.sleep(0),
+                self.api_client.fetch_midpoint(down_token_id) if down_token_id else asyncio.sleep(0),
+            )
+            if up_mid is not None:
+                up_price = float(up_mid)
+            if down_mid is not None:
+                down_price = float(down_mid)
+        except Exception as exc:
+            logger.warning("⚠️  get_token_prices failed: %s — using defaults", exc)
+            return default
+
+        logger.info(
+            "💲 Token prices: Up=%.3f Down=%.3f",
+            up_price,
+            down_price,
+        )
+        return {"up": up_price, "down": down_price}
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
