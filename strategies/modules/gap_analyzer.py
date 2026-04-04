@@ -5,7 +5,8 @@ and Polymarket settlement reference price.
 """
 
 import logging
-from typing import Optional
+import re
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -30,20 +31,38 @@ class GapAnalyzer:
     # Public API
     # ------------------------------------------------------------------
 
-    def get_current_gap(self, market_id: str, current_btc_price: float) -> float:
+    def get_current_gap(
+        self,
+        market_id: str,
+        current_btc_price: float,
+        market_data: Optional[Dict[str, Any]] = None,
+    ) -> float:
         """
         Calculate gap between current BTC price and market reference price.
 
         Args:
             market_id: Polymarket market identifier.
             current_btc_price: Latest BTC spot price (e.g. from Binance).
+            market_data: Optional market dict containing a ``strike`` field
+                (used in dry-run mode to avoid parsing the ID).
 
         Returns:
             Gap in dollars.  Positive → price is ABOVE reference (UP gap).
             Negative → price is BELOW reference (DOWN gap).
         """
-        reference_price = self._get_reference_price(market_id, current_btc_price)
+        reference_price = self._get_reference_price(market_id, current_btc_price, market_data)
         gap = current_btc_price - reference_price
+
+        if abs(gap) > 5000:
+            logger.warning(
+                "⚠️ Suspiciously large gap detected: $%.2f | "
+                "BTC=%.2f, ref=%.2f | "
+                "This might indicate incorrect reference price!",
+                gap,
+                current_btc_price,
+                reference_price,
+            )
+
         logger.debug(
             "Market %s | BTC=%.2f | ref=%.2f | gap=%.2f",
             market_id,
@@ -119,33 +138,59 @@ class GapAnalyzer:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _get_reference_price(self, market_id: str, current_btc_price: float) -> float:
+    def _get_reference_price(
+        self,
+        market_id: str,
+        current_btc_price: float,
+        market_data: Optional[Dict[str, Any]] = None,
+    ) -> float:
         """
         Retrieve the market's reference (strike) price.
 
-        In live mode the CLOB client is used to fetch the market metadata.
-        In dry-run mode (no client) the market_id is expected to encode the
-        strike price as the last numeric segment, e.g. ``BTC-5MIN-95000``.
-        Falls back to ``current_btc_price`` if parsing fails.
+        Priority:
+        1. Live mode: fetch from CLOB client.
+        2. Dry-run with ``market_data``: use ``market_data["strike"]``.
+        3. Fallback: current BTC price (produces a zero gap; logged as warning).
         """
         if self.clob_client is not None:
             return self._fetch_reference_from_clob(market_id)
 
-        # Dry-run: parse strike from market id
-        return self._parse_strike_from_id(market_id, current_btc_price)
+        # Dry-run: use strike from market_data if provided
+        if market_data and "strike" in market_data:
+            return float(market_data["strike"])
+
+        # Fallback: using current BTC price produces a neutral (zero) gap
+        logger.warning(
+            "No reference price available for %s, using current BTC price as fallback",
+            market_id,
+        )
+        return current_btc_price
 
     def _fetch_reference_from_clob(self, market_id: str) -> float:
         """Fetch reference price from Polymarket CLOB."""
         try:
             market = self.clob_client.get_market(market_id)
-            # The CLOB API returns the strike / reference as 'question_id' data
-            # embedded in market outcomes.  We look for a numeric outcome label.
+
+            # Method 1: Parse from question text (most reliable)
+            # Matches patterns like "$67,114.77", "$67114", "67114.77"
+            question = market.get("question", "")
+            match = re.search(r'\$?([\d,]+(?:\.\d+)?)', question)
+            if match:
+                price_str = match.group(1).replace(",", "")
+                reference = float(price_str)
+                logger.debug(
+                    "Parsed reference $%.2f from question: %s", reference, question
+                )
+                return reference
+
+            # Method 2: Try outcome labels (original logic)
             for outcome in market.get("outcomes", []):
                 label = outcome.get("label", "")
                 try:
                     return float(label.replace(",", "").replace("$", ""))
                 except ValueError:
                     continue
+
             logger.warning("Could not parse reference price from CLOB for %s", market_id)
             return self._price_cache.get(market_id, 0.0)
         except Exception as exc:
@@ -154,7 +199,22 @@ class GapAnalyzer:
 
     @staticmethod
     def _parse_strike_from_id(market_id: str, fallback: float) -> float:
-        """Parse a numeric strike price from a market-ID string."""
+        """
+        Parse a numeric strike price from a market-ID string.
+
+        .. deprecated::
+            This method is unreliable because the numeric suffix in a market ID
+            (e.g. ``BTC-5MIN-65600``) is *not* guaranteed to be the reference
+            price.  Pass ``market_data`` to :meth:`get_current_gap` instead.
+            This method is kept only for backwards-compatibility and will be
+            removed in a future release.
+        """
+        logger.warning(
+            "_parse_strike_from_id() is deprecated and may return an incorrect "
+            "reference price for market '%s'. Pass market_data with a 'strike' "
+            "field to get_current_gap() instead.",
+            market_id,
+        )
         parts = market_id.replace("-", "_").split("_")
         for part in reversed(parts):
             try:
