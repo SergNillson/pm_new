@@ -12,6 +12,9 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+# Duration of a single Polymarket BTC 5-minute window in seconds
+WINDOW_DURATION_SECONDS = 300
+
 
 class GapAnalyzer:
     """
@@ -146,7 +149,7 @@ class GapAnalyzer:
         except Exception:
             return None
 
-        window_start_ts = end_ts - 5 * 60  # 5-minute window
+        window_start_ts = end_ts - WINDOW_DURATION_SECONDS
         now_ts = time.time()
 
         # Window has not started yet

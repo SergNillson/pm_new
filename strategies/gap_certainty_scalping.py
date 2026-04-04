@@ -105,6 +105,11 @@ PARTIAL_EXIT_PRICE = 0.50        # Mid-market price used for partial-exit sells
 SIMULATED_BTC_BASE_PRICE = 65_000.0
 SIMULATED_BTC_RANGE = 500.0
 
+# Simulated Up/Down token prices used in dry-run when the implied gap is significant
+_DRY_RUN_UP_PRICE = 0.80       # Simulated confident-side token price (high certainty)
+_DRY_RUN_DOWN_PRICE = 0.20     # Simulated opposing-side token price
+_DRY_RUN_UP_GAP_THRESHOLD = 0  # Any positive/negative gap triggers the simulation
+
 
 # ===========================================================================
 # Realistic market simulator (dry-run)
@@ -643,22 +648,30 @@ class GapCertaintyStrategy:
         market_id = market.get("condition_id", market.get("id", ""))
         time_left_seconds = int(market["settlement_time"] - time.time())
 
-        # Seed reference price on first observation (window start)
-        self.gap_analyzer.seed_reference_price(market, btc_price)
+        # Seed reference price on first observation for Up/Down markets that
+        # lack an explicit strike.  Synthetic dry-run markets already carry a
+        # strike, so we skip seeding to preserve that reference.
+        if not market.get("strike"):
+            self.gap_analyzer.seed_reference_price(market, btc_price)
 
         # Get Up/Down token prices from orderbook
         if self.paper_trading and self.paper_engine is not None:
             token_prices = await self.paper_engine.get_token_prices(market)
         else:
-            # In dry-run / live mode: derive implied prices from the gap
+            # In dry-run / live mode: derive implied prices from the gap.
+            # Using named constants avoids magic numbers in the simulation.
             ref = self.gap_analyzer.get_reference_price_for_window(market)
             if ref is None:
-                ref = market.get("strike") or btc_price
-            implied_gap = btc_price - (ref if ref else btc_price)
-            if implied_gap > 0:
-                token_prices = {"up": 0.80, "down": 0.20}
-            elif implied_gap < 0:
-                token_prices = {"up": 0.20, "down": 0.80}
+                # Fall back to explicit strike (synthetic / legacy markets)
+                try:
+                    ref = float(market["strike"]) if market.get("strike") else btc_price
+                except (TypeError, ValueError):
+                    ref = btc_price
+            implied_gap = btc_price - ref
+            if implied_gap > _DRY_RUN_UP_GAP_THRESHOLD:
+                token_prices = {"up": _DRY_RUN_UP_PRICE, "down": _DRY_RUN_DOWN_PRICE}
+            elif implied_gap < -_DRY_RUN_UP_GAP_THRESHOLD:
+                token_prices = {"up": _DRY_RUN_DOWN_PRICE, "down": _DRY_RUN_UP_PRICE}
             else:
                 token_prices = {"up": 0.50, "down": 0.50}
 

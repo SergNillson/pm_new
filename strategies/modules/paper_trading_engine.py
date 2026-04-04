@@ -373,14 +373,26 @@ class PaperTradingEngine:
         up_price: float = 0.5
         down_price: float = 0.5
         try:
-            up_mid, down_mid = await asyncio.gather(
-                self.api_client.fetch_midpoint(up_token_id) if up_token_id else asyncio.sleep(0),
-                self.api_client.fetch_midpoint(down_token_id) if down_token_id else asyncio.sleep(0),
-            )
-            if up_mid is not None:
-                up_price = float(up_mid)
-            if down_mid is not None:
-                down_price = float(down_mid)
+            coros = []
+            fetch_up = up_token_id is not None
+            fetch_down = down_token_id is not None
+            if fetch_up:
+                coros.append(self.api_client.fetch_midpoint(up_token_id))
+            if fetch_down:
+                coros.append(self.api_client.fetch_midpoint(down_token_id))
+
+            results = await asyncio.gather(*coros) if coros else []
+
+            idx = 0
+            if fetch_up:
+                mid = results[idx]
+                if mid is not None:
+                    up_price = float(mid)
+                idx += 1
+            if fetch_down:
+                mid = results[idx]
+                if mid is not None:
+                    down_price = float(mid)
         except Exception as exc:
             logger.warning("⚠️  get_token_prices failed: %s — using defaults", exc)
             return default
