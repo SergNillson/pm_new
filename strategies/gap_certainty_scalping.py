@@ -302,7 +302,7 @@ class GapCertaintyStrategy:
         market_id = market["id"]
         time_left = int(market["settlement_time"] - time.time())
 
-        gap = self.gap_analyzer.get_current_gap(market_id, btc_price)
+        gap = self.gap_analyzer.get_current_gap(market_id, btc_price, market_data=market)
 
         if abs(gap) < self.min_gap:
             logger.debug("Gap %.2f < %.2f — no signal for %s", gap, self.min_gap, market_id)
@@ -316,13 +316,26 @@ class GapCertaintyStrategy:
                 logger.debug("Multi-TF misaligned — skipping %s", market_id)
                 return
 
-        logger.info(
-            "🎯 SIGNAL detected | market=%s | gap=$%.2f | vol=%.1f%% | %ds left",
-            market_id,
-            gap,
-            volatility * 100,
-            time_left,
-        )
+        ref_price = market.get("strike")
+        if ref_price is not None:
+            logger.info(
+                "🎯 SIGNAL detected | market=%s | ref=$%.2f | btc=$%.2f | gap=$%.2f | vol=%.1f%% | %ds left",
+                market_id,
+                ref_price,
+                btc_price,
+                gap,
+                volatility * 100,
+                time_left,
+            )
+        else:
+            logger.info(
+                "🎯 SIGNAL detected | market=%s | btc=$%.2f | gap=$%.2f | vol=%.1f%% | %ds left",
+                market_id,
+                btc_price,
+                gap,
+                volatility * 100,
+                time_left,
+            )
 
         size = self.sizer.calculate_size(gap, volatility, time_left)
         await self._enter_position(market, gap, size)
@@ -375,7 +388,7 @@ class GapCertaintyStrategy:
 
             btc_price = await self._get_btc_price()
             market_id = market["id"]
-            current_gap = self.gap_analyzer.get_current_gap(market_id, btc_price)
+            current_gap = self.gap_analyzer.get_current_gap(market_id, btc_price, market_data=market)
 
             if entry_gap != 0:
                 erosion = abs(entry_gap - current_gap) / abs(entry_gap)
@@ -420,7 +433,7 @@ class GapCertaintyStrategy:
         """Settle position and update sizer state."""
         btc_price = await self._get_btc_price()
         market_id = market["id"]
-        final_gap = self.gap_analyzer.get_current_gap(market_id, btc_price)
+        final_gap = self.gap_analyzer.get_current_gap(market_id, btc_price, market_data=market)
         gap_direction_up = final_gap > 0
 
         pnl = await self.executor.settle_position(token, btc_price, gap_direction_up)
