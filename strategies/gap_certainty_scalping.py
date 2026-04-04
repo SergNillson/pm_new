@@ -29,7 +29,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -165,7 +165,7 @@ class SimulatedOrderExecutor:
             "size": size,
             "pnl": pnl,
             "won": won,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self.trade_history.append(record)
         logger.info("[DRY-RUN] Settled %s | P&L=%+.2f (%s)", token, pnl, "WIN ✅" if won else "LOSS ❌")
@@ -215,7 +215,7 @@ class GapCertaintyStrategy:
         self._running = False
         self._paused_until: float = 0.0
         self._daily_start_bankroll = capital
-        self._start_time = datetime.utcnow()
+        self._start_time = datetime.now(timezone.utc)
 
         # CSV logging
         self._csv_path = LOG_DIR / "trades.csv"
@@ -481,7 +481,7 @@ class GapCertaintyStrategy:
         In dry-run mode generates synthetic markets.
         """
         if self.dry_run:
-            return self._synthetic_markets()
+            return await self._synthetic_markets()
 
         # Live mode: query CLOB
         try:
@@ -496,21 +496,38 @@ class GapCertaintyStrategy:
             logger.warning("Failed to fetch live markets: %s", exc)
             return []
 
-    def _synthetic_markets(self) -> List[Dict[str, Any]]:
+    async def _synthetic_markets(self) -> List[Dict[str, Any]]:
         """
         Generate synthetic market data for dry-run testing.
-        Each call simulates one market that settles ~20 seconds from now.
+        Reference prices are set close to current BTC price to simulate
+        real Polymarket behavior (reference set moments before market opens).
         """
         import random  # noqa: PLC0415
 
         now = time.time()
-        strike = round(65_000.0 + random.uniform(-1000, 1000), -2)
+
+        # Get current BTC price so reference is realistic
+        current_btc = await self._get_btc_price()
+
+        # Reference price within ±$100 of current price (real markets are
+        # set moments before open, so gap is usually small)
+        offset = random.uniform(-100, 100)
+        strike = round(current_btc + offset, 2)
+
         market_id = f"BTC-5MIN-{int(strike)}"
+
+        logger.debug(
+            "Generated synthetic market: current_btc=%.2f, strike=%.2f, gap=%.2f",
+            current_btc,
+            strike,
+            offset,
+        )
+
         return [
             {
                 "id": market_id,
                 "condition_id": market_id,
-                "question": f"BTC above ${strike:,.0f} at settlement?",
+                "question": f"BTC above ${strike:,.2f} at settlement?",
                 "settlement_time": now + random.uniform(ENTRY_WINDOW_LOW, ENTRY_WINDOW_HIGH),
                 "strike": strike,
             }
@@ -597,9 +614,8 @@ class GapCertaintyStrategy:
             writer = csv.writer(f)
             writer.writerow(
                 [
-                    datetime.utcnow().isoformat(),
+                    datetime.now(timezone.utc).isoformat(),
                     market["id"],
-                    f"{entry_gap:.2f}",
                     f"{size:.2f}",
                     f"{pnl:.4f}",
                     int(won),
@@ -613,7 +629,7 @@ class GapCertaintyStrategy:
     # ------------------------------------------------------------------
 
     def _print_summary(self) -> None:
-        duration = datetime.utcnow() - self._start_time
+        duration = datetime.now(timezone.utc) - self._start_time
         logger.info("=" * 60)
         logger.info("  Session Summary")
         logger.info("  Duration:       %s", duration)
@@ -685,7 +701,7 @@ class _LiveOrderExecutor:
             "size": size,
             "pnl": pnl,
             "won": won,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         self.trade_history.append(record)
         logger.info("[LIVE] Position settled: P&L=%+.2f (%s)", pnl, "WIN ✅" if won else "LOSS ❌")
