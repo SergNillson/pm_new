@@ -615,7 +615,7 @@ class GapCertaintyStrategy:
             writer.writerow(
                 [
                     datetime.now(timezone.utc).isoformat(),
-                    f"{entry_gap:.2f}",
+                    market["id"],
                     f"{size:.2f}",
                     f"{pnl:.4f}",
                     int(won),
