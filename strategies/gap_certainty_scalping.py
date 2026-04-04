@@ -10,12 +10,18 @@ Modes
 -----
 --dry-run (default)
     Full simulation — no real orders, no credentials required.
+--paper-trading
+    Paper trading with REAL Polymarket data (no auth required).
+    Fetches live markets, orderbook prices, and settlement outcomes from
+    the public Polymarket API.  All orders are simulated — nothing is
+    executed on-chain.
 --live
     Real trading on Polymarket CLOB.  Requires credentials in .env.
 
 Usage
 -----
   python strategies/gap_certainty_scalping.py --dry-run --capital 38
+  python strategies/gap_certainty_scalping.py --paper-trading --capital 38
   python strategies/gap_certainty_scalping.py --live --capital 38
   python strategies/gap_certainty_scalping.py --dry-run --config config/gap_certainty_config.yaml
 """
@@ -56,6 +62,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from strategies.modules.adaptive_sizer import AdaptivePositionSizer
 from strategies.modules.gap_analyzer import GapAnalyzer
 from strategies.modules.volatility_monitor import VolatilityMonitor
+from strategies.modules.paper_trading_engine import PaperTradingEngine
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -505,6 +512,7 @@ class GapCertaintyStrategy:
         max_volatility: float = DEFAULT_MAX_VOL,
         base_size: float = DEFAULT_BASE_SIZE,
         dry_run: bool = True,
+        paper_trading: bool = False,
         config: Optional[Dict[str, Any]] = None,
         enable_realism: bool = True,
     ) -> None:
@@ -512,17 +520,26 @@ class GapCertaintyStrategy:
         self.min_gap = min_gap
         self.max_volatility = max_volatility
         self.dry_run = dry_run
+        self.paper_trading = paper_trading
         self.config = config or {}
 
         # Initialise sub-modules
-        clob_client = None if dry_run else self._build_clob_client()
+        clob_client = None if (dry_run or paper_trading) else self._build_clob_client()
         self.gap_analyzer = GapAnalyzer(clob_client=clob_client)
         self.vol_monitor = VolatilityMonitor()
         self.sizer = AdaptivePositionSizer(capital=capital, base_pct=base_size)
 
-        if dry_run:
+        if paper_trading:
+            # Real Polymarket data, simulated orders — no auth required
+            self.paper_engine: Optional[PaperTradingEngine] = PaperTradingEngine(
+                keyword="BTC"
+            )
             self.executor: Any = SimulatedOrderExecutor(enable_realism=enable_realism)
+        elif dry_run:
+            self.paper_engine = None
+            self.executor = SimulatedOrderExecutor(enable_realism=enable_realism)
         else:
+            self.paper_engine = None
             self.executor = self._build_live_executor(clob_client)
 
         self._running = False
@@ -540,12 +557,21 @@ class GapCertaintyStrategy:
 
     async def run(self) -> None:
         """Start the main event loop."""
-        mode = "DRY-RUN" if self.dry_run else "LIVE"
+        if self.paper_trading:
+            mode = "PAPER-TRADING (real data, no auth)"
+        elif self.dry_run:
+            mode = "DRY-RUN"
+        else:
+            mode = "LIVE"
         logger.info("=" * 60)
         logger.info("  Gap Certainty Scalping Strategy  |  %s mode", mode)
         logger.info("  Capital: $%.2f  |  Min gap: $%.2f  |  Max vol: %.0f%%",
                     self.capital, self.min_gap, self.max_volatility * 100)
         logger.info("=" * 60)
+
+        # Start the paper trading engine's background monitor if applicable
+        if self.paper_trading and self.paper_engine is not None:
+            await self.paper_engine.start()
 
         self._running = True
         try:
@@ -553,6 +579,8 @@ class GapCertaintyStrategy:
         except KeyboardInterrupt:
             logger.info("Strategy stopped by user.")
         finally:
+            if self.paper_trading and self.paper_engine is not None:
+                await self.paper_engine.stop()
             self._print_summary()
 
     async def stop(self) -> None:
@@ -675,7 +703,21 @@ class GapCertaintyStrategy:
             gap,
         )
 
-        await self.executor.place_order(side, token, price, size, gap=gap)
+        if self.paper_trading and self.paper_engine is not None:
+            # Paper trading: use real orderbook slippage through PaperTradingEngine
+            order = await self.paper_engine.place_paper_order(
+                market=market.get("_raw", market),
+                side=side,
+                size_usd=size,
+            )
+            if order is None:
+                logger.warning("⚠️  Paper order placement failed — skipping monitor.")
+                return
+            # Use the actual token that was registered in the P&L tracker
+            token = order.get("token_id", token)
+        else:
+            await self.executor.place_order(side, token, price, size, gap=gap)
+
         await self._monitor_position(market, token, gap, size)
 
     # ------------------------------------------------------------------
@@ -745,13 +787,22 @@ class GapCertaintyStrategy:
         forced: bool = False,
     ) -> None:
         """Settle position and update sizer state."""
-        btc_price = await self._get_btc_price()
-        market_id = market["id"]
-        final_gap = self.gap_analyzer.get_current_gap(market_id, btc_price, market_data=market)
-        gap_direction_up = final_gap > 0
-
-        pnl = await self.executor.settle_position(token, btc_price, gap_direction_up, entry_gap=entry_gap)
-        won = pnl >= 0
+        if self.paper_trading and self.paper_engine is not None:
+            # Use real settlement outcome from Polymarket API
+            condition_id = market.get("condition_id", market["id"])
+            pnl = await self.paper_engine.settle_paper_position(token, condition_id)
+            if pnl is None:
+                # Market not yet resolved — use per-position unrealized P&L as estimate
+                midpoint = await self.paper_engine.api_client.fetch_midpoint(token)
+                pnl = self.paper_engine.pnl_tracker.update_unrealized(token, midpoint or 0.5) or 0.0
+            won = pnl >= 0
+        else:
+            btc_price = await self._get_btc_price()
+            market_id = market["id"]
+            final_gap = self.gap_analyzer.get_current_gap(market_id, btc_price, market_data=market)
+            gap_direction_up = final_gap > 0
+            pnl = await self.executor.settle_position(token, btc_price, gap_direction_up, entry_gap=entry_gap)
+            won = pnl >= 0
 
         self.sizer.update_after_trade(pnl, won)
         self._log_trade_csv(market, entry_gap, size, pnl, won, forced)
@@ -781,8 +832,8 @@ class GapCertaintyStrategy:
             return float(ticker["last"])
         except Exception as exc:
             logger.debug("Binance ticker fetch failed: %s", exc)
-            if self.dry_run:
-                # Simulated price for dry-run demonstration
+            if self.dry_run or self.paper_trading:
+                # Simulated price for dry-run / paper-trading demonstration
                 import random  # noqa: PLC0415
 
                 base = SIMULATED_BTC_BASE_PRICE
@@ -792,8 +843,50 @@ class GapCertaintyStrategy:
     async def _get_active_markets(self) -> List[Dict[str, Any]]:
         """
         Return a list of active BTC 5-minute Polymarket markets.
-        In dry-run mode generates synthetic markets.
+
+        * paper-trading mode: fetches real data from Polymarket public API.
+        * dry-run mode:       generates synthetic markets.
+        * live mode:          queries the authenticated CLOB API.
         """
+        if self.paper_trading and self.paper_engine is not None:
+            markets = await self.paper_engine.refresh_markets()
+            # Normalise to the shape expected by the rest of the strategy
+            result: List[Dict[str, Any]] = []
+            now = time.time()
+            for m in markets:
+                end_date = m.get("end_date_iso") or m.get("endDateIso") or m.get("end_date")
+                settlement_ts = now + 30.0  # default fallback
+                if end_date:
+                    try:
+                        dt = datetime.fromisoformat(
+                            end_date.replace("Z", "+00:00")
+                        )
+                        settlement_ts = dt.timestamp()
+                    except Exception as exc:
+                        logger.warning(
+                            "⚠️  Could not parse end_date '%s' for market %s: %s — using 30s fallback",
+                            end_date,
+                            m.get("condition_id") or m.get("id"),
+                            exc,
+                        )
+
+                # Skip already-expired markets
+                if settlement_ts <= now:
+                    continue
+
+                condition_id = m.get("condition_id") or m.get("id") or ""
+                result.append({
+                    "id": condition_id,
+                    "condition_id": condition_id,
+                    "question": m.get("question", ""),
+                    "settlement_time": settlement_ts,
+                    # strike may not be available for non-numeric markets
+                    "strike": m.get("strike") or m.get("outcomePrices"),
+                    "tokens": m.get("tokens", []),
+                    "_raw": m,
+                })
+            return result
+
         if self.dry_run:
             return await self._synthetic_markets()
 
@@ -1071,6 +1164,16 @@ def parse_args() -> argparse.Namespace:
         help="Simulation mode (default). No credentials required.",
     )
     mode_group.add_argument(
+        "--paper-trading",
+        action="store_true",
+        default=False,
+        help=(
+            "Paper trading mode: fetches REAL Polymarket markets, orderbook prices, "
+            "and settlement outcomes via public API (no credentials required). "
+            "Orders are simulated — nothing is executed on-chain."
+        ),
+    )
+    mode_group.add_argument(
         "--live",
         action="store_true",
         default=False,
@@ -1131,6 +1234,7 @@ def main() -> None:
 
     # CLI flags override config file values
     live_mode = args.live
+    paper_trading_mode = getattr(args, "paper_trading", False)
     capital = config.get("capital", {}).get("initial", args.capital)
     min_gap = config.get("entry", {}).get("min_gap", args.min_gap)
     max_vol = config.get("entry", {}).get("max_volatility", args.max_volatility)
@@ -1141,7 +1245,8 @@ def main() -> None:
         min_gap=min_gap,
         max_volatility=max_vol,
         base_size=base_size,
-        dry_run=not live_mode,
+        dry_run=not live_mode and not paper_trading_mode,
+        paper_trading=paper_trading_mode,
         config=config,
         enable_realism=not args.disable_realism,
     )
