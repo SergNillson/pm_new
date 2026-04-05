@@ -97,10 +97,16 @@ class PaperTradingEngine:
         """
         Fetch current BTC markets from Polymarket and cache them.
 
+        Tries ``fetch_btc_5min_market`` first (handles the "Bitcoin Up or Down"
+        naming convention), then falls back to a plain keyword search.
+
         Returns:
             List of active market dicts.
         """
-        markets = await self.api_client.fetch_markets(keyword=self.keyword)
+        markets = await self.api_client.fetch_btc_5min_market()
+        if not markets:
+            # Fallback: generic keyword search
+            markets = await self.api_client.fetch_markets(keyword=self.keyword)
         self._active_markets.clear()
         for mkt in markets:
             cid = mkt.get("condition_id") or mkt.get("id") or ""

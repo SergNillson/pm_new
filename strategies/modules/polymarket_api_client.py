@@ -121,6 +121,86 @@ class PolymarketAPIClient:
             logger.warning("⚠️  fetch_markets failed: %s", exc)
             return []
 
+    async def fetch_btc_5min_market(self) -> List[Dict[str, Any]]:
+        """
+        Fetch Bitcoin Up-or-Down 5-minute markets from Polymarket.
+
+        Tries the ``/events`` endpoint first (which groups related markets under
+        an event), then falls back to the ``/markets`` endpoint with the keyword
+        "Bitcoin".  The "Bitcoin Up or Down" 5-minute markets use "Bitcoin" in
+        their title, not the abbreviation "BTC", which is why a plain
+        keyword="BTC" search returns zero results.
+
+        Returns:
+            List of market dicts (same shape as :meth:`fetch_markets`).
+        """
+        logger.info("🔀 Redirecting to fetch_btc_5min_market() for BTC markets")
+
+        # ------------------------------------------------------------------
+        # Attempt 1: /events endpoint
+        # ------------------------------------------------------------------
+        try:
+            session = await self._get_session()
+            url = f"{GAMMA_API_BASE}/events"
+            params: Dict[str, Any] = {
+                "active": "true",
+                "archived": "false",
+                "limit": 100,
+            }
+            async with session.get(url, params=params) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+
+            events = data if isinstance(data, list) else data.get("events", [])
+
+            # Keep only Bitcoin-related events
+            btc_events = [
+                e for e in events
+                if "bitcoin" in e.get("title", "").lower()
+                or "bitcoin" in e.get("slug", "").lower()
+                or "btc" in e.get("title", "").lower()
+                or "btc" in e.get("slug", "").lower()
+            ]
+
+            markets: List[Dict[str, Any]] = []
+            for event in btc_events:
+                for mkt in event.get("markets", []):
+                    markets.append(mkt)
+
+            if markets:
+                logger.info(
+                    "✅ Found %d BTC 5-min market(s) via /events", len(markets)
+                )
+                return markets
+
+        except Exception as exc:
+            logger.warning(
+                "⚠️  fetch_btc_5min_market via /events failed: %s — trying /markets",
+                exc,
+            )
+
+        # ------------------------------------------------------------------
+        # Attempt 2: /markets with "Bitcoin" keyword
+        # ------------------------------------------------------------------
+        markets = await self.fetch_markets(keyword="Bitcoin", active_only=True)
+        if markets:
+            logger.info(
+                "✅ Found %d BTC 5-min market(s) via /markets (keyword=Bitcoin)",
+                len(markets),
+            )
+            return markets
+
+        # ------------------------------------------------------------------
+        # Attempt 3: /markets with "Up or Down" keyword
+        # ------------------------------------------------------------------
+        markets = await self.fetch_markets(keyword="Up or Down", active_only=True)
+        if markets:
+            logger.info(
+                "✅ Found %d BTC 5-min market(s) via /markets (keyword='Up or Down')",
+                len(markets),
+            )
+        return markets
+
     # ------------------------------------------------------------------
     # Orderbook
     # ------------------------------------------------------------------
