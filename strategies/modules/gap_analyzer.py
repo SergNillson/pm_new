@@ -210,17 +210,22 @@ class GapAnalyzer:
                         window_dt.strftime("%H:%M:%S"),
                     )
                 else:
-                    logger.warning("No historical kline data, using current price as fallback")
-                    ticker = exchange.fetch_ticker("BTC/USDT")
-                    reference_price = float(ticker["last"])
+                    # Returning None here ensures no near-zero gap trade is entered
+                    # when historical data is unavailable.
+                    logger.warning(
+                        "No historical kline data available for market %s — skipping reference price",
+                        market_id[:20],
+                    )
+                    return None
             except Exception as exc:
+                # Returning None here prevents a fallback to current price which would
+                # produce a near-zero gap and trigger spurious trades.
                 logger.warning(
-                    "Error fetching klines for market %s: %s, using current price",
+                    "Error fetching klines for market %s: %s — skipping reference price",
                     market_id[:20],
                     exc,
                 )
-                ticker = exchange.fetch_ticker("BTC/USDT")
-                reference_price = float(ticker["last"])
+                return None
 
             # Cache it
             self._reference_prices[market_id] = reference_price
