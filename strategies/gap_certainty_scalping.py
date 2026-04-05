@@ -598,10 +598,12 @@ class GapCertaintyStrategy:
     # ------------------------------------------------------------------
 
     async def _main_loop(self) -> None:
+        logger.info("🔄 Main loop started")
         logger.info("📊 Scanning BTC 5-min markets...")
 
         while self._running:
             now = time.time()
+            logger.debug("--- New scan iteration ---")
 
             # Respect pause period after consecutive losses
             if now < self._paused_until:
@@ -628,17 +630,28 @@ class GapCertaintyStrategy:
 
             # Scan markets
             markets = await self._get_active_markets()
-            for market in markets:
-                time_left = market["settlement_time"] - now
-                if ENTRY_WINDOW_LOW <= time_left <= ENTRY_WINDOW_HIGH:
-                    try:
-                        await self._check_entry_signal(market, current_btc_price, current_vol)
-                    except Exception as exc:
-                        logger.error(
-                            "Error checking signal for market %s: %s",
-                            market.get("id", "?"),
-                            exc,
-                        )
+
+            if not markets:
+                logger.debug("No markets found, waiting...")
+                await asyncio.sleep(SCAN_INTERVAL)
+                continue
+
+            logger.debug("Analyzing %d market(s)", len(markets))
+
+            for i, market in enumerate(markets, 1):
+                logger.debug("--- Market %d/%d ---", i, len(markets))
+                try:
+                    await self._check_entry_signal(market, current_btc_price, current_vol)
+                except Exception as exc:
+                    import traceback as _tb  # noqa: PLC0415
+
+                    logger.error(
+                        "Error checking signal for market %d (%s): %s",
+                        i,
+                        market.get("id", "?"),
+                        exc,
+                    )
+                    logger.error(_tb.format_exc())
 
             await asyncio.sleep(SCAN_INTERVAL)
 
@@ -654,12 +667,20 @@ class GapCertaintyStrategy:
     ) -> None:
         """Evaluate market for a Momentum + Gap trading signal."""
         market_id = market.get("condition_id", market.get("id", ""))
+        question = market.get("question", "Unknown market")
+
+        # LOG 1: Start of analysis
+        logger.info("🔍 Analyzing market: %s...", question[:60])
 
         # Skip if already have an open position for this market
         if market_id in self._active_positions:
+            logger.info("⏭️  Skip: Already have position for %s...", market_id[:20])
             return
 
         time_left_seconds = int(market["settlement_time"] - time.time())
+
+        # LOG 2: Time check
+        logger.info("⏰ Time until settlement: %ds", time_left_seconds)
 
         # Seed reference price on first observation for Up/Down markets that
         # lack an explicit strike.  Synthetic dry-run markets already carry a
@@ -669,7 +690,11 @@ class GapCertaintyStrategy:
 
         # Get Up/Down token prices from orderbook
         if self.paper_trading and self.paper_engine is not None:
-            token_prices = await self.paper_engine.get_token_prices(market)
+            try:
+                token_prices = await self.paper_engine.get_token_prices(market)
+            except Exception as exc:
+                logger.error("❌ Failed to get token prices: %s", exc)
+                return
         else:
             # In dry-run / live mode: derive implied prices from the gap.
             # Using named constants avoids magic numbers in the simulation.
@@ -691,29 +716,42 @@ class GapCertaintyStrategy:
         up_price = token_prices.get("up", 0.5)
         down_price = token_prices.get("down", 0.5)
 
+        # LOG 3: Current BTC price
+        logger.info("📈 Current BTC price: $%s", f"{btc_price:,.2f}")
+
         logger.debug(
             "Market %s... | Time left: %ds | Up: %.3f Down: %.3f",
-            market.get("question", market_id)[:50],
+            question[:50],
             time_left_seconds,
             up_price,
             down_price,
         )
 
         # Check Momentum + Gap signal
-        signal = self.gap_analyzer.check_momentum_gap_signal(
-            market_data=market,
-            current_btc_price=btc_price,
-            up_token_price=up_price,
-            down_token_price=down_price,
-            min_token_price_threshold=self.config.get("entry", {}).get("min_token_price", 0.75),
-            min_gap=self.min_gap,
-            max_time_left=self.config.get("entry", {}).get("max_time_left", ENTRY_WINDOW_HIGH),
-            min_time_left=self.config.get("entry", {}).get("min_time_left", ENTRY_WINDOW_LOW),
-        )
+        try:
+            signal = self.gap_analyzer.check_momentum_gap_signal(
+                market_data=market,
+                current_btc_price=btc_price,
+                up_token_price=up_price,
+                down_token_price=down_price,
+                min_token_price_threshold=self.config.get("entry", {}).get("min_token_price", 0.75),
+                min_gap=self.min_gap,
+                max_time_left=self.config.get("entry", {}).get("max_time_left", ENTRY_WINDOW_HIGH),
+                min_time_left=self.config.get("entry", {}).get("min_time_left", ENTRY_WINDOW_LOW),
+            )
+        except Exception as exc:
+            import traceback as _tb  # noqa: PLC0415
 
+            logger.error("❌ Error in signal analysis: %s", exc)
+            logger.error(_tb.format_exc())
+            return
+
+        # LOG 4: Signal result
         if signal is None:
-            return  # No signal
+            logger.info("❌ No signal - conditions not met")
+            return
 
+        # LOG 5: Signal found
         logger.info(
             "🎯 MOMENTUM+GAP SIGNAL | "
             "Side: %s | "
@@ -735,6 +773,13 @@ class GapCertaintyStrategy:
             signal["gap"],
             volatility,
             signal["time_left"],
+        )
+
+        # LOG 6: Position size
+        logger.info(
+            "💰 Position size calculated: $%.2f (%.1f%% of capital)",
+            size,
+            (size / self.capital) * 100,
         )
 
         # Enter position

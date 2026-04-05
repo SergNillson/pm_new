@@ -404,9 +404,11 @@ class PaperTradingEngine:
             return default
 
         logger.info(
-            "💲 Token prices: Up=%.3f Down=%.3f",
+            "💲 Token prices: Up=%.3f (%.1f%%) Down=%.3f (%.1f%%)",
             up_price,
+            up_price * 100,
             down_price,
+            down_price * 100,
         )
         return {"up": up_price, "down": down_price}
 
