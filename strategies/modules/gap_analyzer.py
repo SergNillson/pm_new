@@ -7,8 +7,14 @@ and Polymarket settlement reference price.
 import logging
 import re
 import time
+import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+
+try:
+    import ccxt as _ccxt
+except ImportError:  # pragma: no cover
+    _ccxt = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +39,8 @@ class GapAnalyzer:
         self._price_cache: dict = {}
         # Cache of reference prices keyed by market condition_id / id
         self._reference_prices: Dict[str, float] = {}
+        # Shared ccxt Binance exchange instance — initialised lazily on first use
+        self._binance_exchange: Optional[Any] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -108,14 +116,16 @@ class GapAnalyzer:
         """
         Get reference price for an Up/Down market window.
 
-        Reference price = BTC price at the start of the 5-minute window.
+        Reference price = BTC price at the START of the 5-minute window.
+        Uses Binance historical klines data for accuracy.
 
         The method uses the following priority:
         1. Cached value (``self._reference_prices``) if already stored.
-        2. Estimated from the first time we observe the market within the window
-           (the current BTC price is stored as the reference when the window begins).
-        3. Returns ``None`` if ``endDate`` cannot be parsed or the window has
-           not started yet.
+        2. Explicit ``reference_price`` field in ``market_data``.
+        3. Binance historical 1-minute kline open price at window start time.
+        4. Binance current ticker price as a last-resort fallback.
+        5. Returns ``None`` if the window has not started yet or the end time
+           cannot be determined.
 
         Args:
             market_data: Market dict from Polymarket API.
@@ -129,25 +139,35 @@ class GapAnalyzer:
 
         # 1. Return cached reference price
         if market_id in self._reference_prices:
-            return self._reference_prices[market_id]
+            ref_price = self._reference_prices[market_id]
+            logger.debug("Using cached reference price: $%s", f"{ref_price:,.2f}")
+            return ref_price
 
-        # 2. Determine window_start from endDate (endDate - 5 minutes)
-        end_date_str = (
-            market_data.get("end_date_iso")
-            or market_data.get("endDateIso")
-            or market_data.get("end_date")
-            or market_data.get("endDate")
-        )
-        if not end_date_str:
-            return None
+        # 2. Use explicit reference_price field if present
+        if market_data.get("reference_price") is not None:
+            ref = float(market_data["reference_price"])
+            self._reference_prices[market_id] = ref
+            logger.info("📍 Reference price for window (from field): $%s", f"{ref:,.2f}")
+            return ref
 
-        try:
-            end_dt = datetime.fromisoformat(
-                str(end_date_str).replace("Z", "+00:00")
+        # 3. Determine window_start from settlement_time or endDate
+        end_ts: Optional[float] = market_data.get("settlement_time")
+        if end_ts is None:
+            end_date_str = (
+                market_data.get("end_date_iso")
+                or market_data.get("endDateIso")
+                or market_data.get("end_date")
+                or market_data.get("endDate")
             )
-            end_ts = end_dt.timestamp()
-        except Exception:
-            return None
+            if not end_date_str:
+                return None
+            try:
+                end_dt = datetime.fromisoformat(
+                    str(end_date_str).replace("Z", "+00:00")
+                )
+                end_ts = end_dt.timestamp()
+            except Exception:
+                return None
 
         window_start_ts = end_ts - WINDOW_DURATION_SECONDS
         now_ts = time.time()
@@ -161,17 +181,65 @@ class GapAnalyzer:
             )
             return None
 
-        # Window started; if we have a settlement_time already in market_data but
-        # the market provided a reference_price field, use it directly.
-        if market_data.get("reference_price") is not None:
-            ref = float(market_data["reference_price"])
-            self._reference_prices[market_id] = ref
-            logger.info("📍 Reference price for window (from field): $%s", f"{ref:,.2f}")
-            return ref
+        # 4. Fetch historical price at window start from Binance klines
+        try:
+            if _ccxt is None:
+                logger.error("ccxt is not installed — cannot fetch reference price")
+                return None
 
-        # No cached value and no explicit field — caller should seed the cache via
-        # seed_reference_price() the first time they observe the window start.
-        return None
+            if self._binance_exchange is None:
+                self._binance_exchange = _ccxt.binance()
+            exchange = self._binance_exchange
+            window_start_ms = int(window_start_ts * 1000)
+
+            try:
+                klines = exchange.fetch_ohlcv(
+                    symbol="BTC/USDT",
+                    timeframe="1m",
+                    since=window_start_ms,
+                    limit=1,
+                )
+                if klines and len(klines) > 0:
+                    # klines format: [timestamp, open, high, low, close, volume]
+                    # Use open price of the candle as reference
+                    reference_price = float(klines[0][1])
+                    window_dt = datetime.fromtimestamp(window_start_ts, tz=timezone.utc)
+                    logger.info(
+                        "📍 Reference price from Binance kline: $%s at %s UTC",
+                        f"{reference_price:,.2f}",
+                        window_dt.strftime("%H:%M:%S"),
+                    )
+                else:
+                    # Returning None here ensures no near-zero gap trade is entered
+                    # when historical data is unavailable.
+                    logger.warning(
+                        "No historical kline data available for market %s — skipping reference price",
+                        market_id[:20],
+                    )
+                    return None
+            except Exception as exc:
+                # Returning None here prevents a fallback to current price which would
+                # produce a near-zero gap and trigger spurious trades.
+                logger.warning(
+                    "Error fetching klines for market %s: %s — skipping reference price",
+                    market_id[:20],
+                    exc,
+                )
+                return None
+
+            # Cache it
+            self._reference_prices[market_id] = reference_price
+            logger.info(
+                "📍 Reference price seeded for window %s...: $%s",
+                market_id[:20],
+                f"{reference_price:,.2f}",
+            )
+            return reference_price
+
+        except Exception as exc:
+            logger.error("Error getting reference price: %s", exc)
+            logger.error(traceback.format_exc())
+            return None
 
     def seed_reference_price(self, market_data: Dict[str, Any], btc_price: float) -> None:
         """

@@ -551,6 +551,10 @@ class GapCertaintyStrategy:
         self._paused_until: float = 0.0
         self._daily_start_bankroll = capital
         self._start_time = datetime.now(timezone.utc)
+        # Track markets that currently have an open position
+        self._active_positions: Dict[str, Any] = {}
+        # Keep strong references to background monitoring tasks to prevent GC
+        self._monitoring_tasks: set = set()
 
         # CSV logging
         self._csv_path = LOG_DIR / "trades.csv"
@@ -648,11 +652,10 @@ class GapCertaintyStrategy:
         market_id = market.get("condition_id", market.get("id", ""))
         time_left_seconds = int(market["settlement_time"] - time.time())
 
-        # Seed reference price on first observation for Up/Down markets that
-        # lack an explicit strike.  Synthetic dry-run markets already carry a
-        # strike, so we skip seeding to preserve that reference.
-        if not market.get("strike"):
-            self.gap_analyzer.seed_reference_price(market, btc_price)
+        # Skip markets that already have an open position
+        if market_id in self._active_positions:
+            logger.info("⏭️  Skip: Already have position for market %s...", market_id[:20])
+            return
 
         # Get Up/Down token prices from orderbook
         if self.paper_trading and self.paper_engine is not None:
@@ -744,6 +747,7 @@ class GapCertaintyStrategy:
         side = signal["side"]
         entry_price = signal["entry_price"]
         gap = signal["gap"]
+        market_id = market.get("condition_id", market.get("id", ""))
 
         logger.info(
             "📈 ENTERING %s POSITION | size=$%.2f (%.1f%%) | price=%.3f | gap=$%+.2f",
@@ -769,7 +773,35 @@ class GapCertaintyStrategy:
         else:
             await self.executor.place_order(side, token, entry_price, size, gap=gap)
 
-        await self._monitor_position(market, token, gap, size)
+        # Track the active position so we don't re-enter the same market
+        self._active_positions[market_id] = {
+            "side": side,
+            "token": token,
+            "entry_price": entry_price,
+            "gap": gap,
+            "size": size,
+        }
+
+        logger.info("✅ Position opened: %s %s... @ %.3f", side, token[:20], entry_price)
+
+        # Monitor in a background task so the main loop keeps scanning other markets.
+        # Keep a strong reference to prevent the task from being garbage-collected before
+        # it completes; the done-callback removes it from the set.
+        task = asyncio.create_task(self._monitor_position(market, token, gap, size))
+        self._monitoring_tasks.add(task)
+
+        def _on_monitor_done(t: asyncio.Task) -> None:
+            self._monitoring_tasks.discard(t)
+            exc = t.exception() if not t.cancelled() else None
+            if exc is not None:
+                logger.error(
+                    "❌ Unhandled exception in _monitor_position for market %s: %s",
+                    market_id[:20],
+                    exc,
+                    exc_info=exc,
+                )
+
+        task.add_done_callback(_on_monitor_done)
 
     def _get_token_id_for_side(
         self,
@@ -867,49 +899,57 @@ class GapCertaintyStrategy:
         """
         Watch an open position for partial / emergency exit signals,
         then settle at expiry.
+
+        Runs as a background task so the main loop can keep scanning other markets.
+        Removes the market from ``_active_positions`` when monitoring is complete.
         """
+        market_id = market.get("condition_id", market.get("id", ""))
         partial_exited = False
         settlement_time = market["settlement_time"]
 
-        while time.time() < settlement_time and self._running:
-            remaining = settlement_time - time.time()
-            logger.info("⏳ Monitoring... %.0fs until settlement", remaining)
+        try:
+            while time.time() < settlement_time and self._running:
+                remaining = settlement_time - time.time()
+                logger.info("⏳ Monitoring... %.0fs until settlement", remaining)
 
-            btc_price = await self._get_btc_price()
-            market_id = market["id"]
-            current_gap = self.gap_analyzer.get_current_gap(market_id, btc_price, market_data=market)
+                btc_price = await self._get_btc_price()
+                current_gap = self.gap_analyzer.get_current_gap(market_id, btc_price, market_data=market)
 
-            if entry_gap != 0:
-                erosion = abs(entry_gap - current_gap) / abs(entry_gap)
-            else:
-                erosion = 0.0
+                if entry_gap != 0:
+                    erosion = abs(entry_gap - current_gap) / abs(entry_gap)
+                else:
+                    erosion = 0.0
 
-            # Emergency exit: gap reversed or erosion > 70 %
-            if erosion > EMERGENCY_EXIT_THRESHOLD or (
-                entry_gap > 0 and current_gap < 0
-            ) or (entry_gap < 0 and current_gap > 0):
-                logger.warning(
-                    "🚨 Emergency exit triggered | erosion=%.1f%%", erosion * 100
-                )
-                await self._settle(market, token, entry_gap, size, forced=True)
-                return
+                # Emergency exit: gap reversed or erosion > 70 %
+                if erosion > EMERGENCY_EXIT_THRESHOLD or (
+                    entry_gap > 0 and current_gap < 0
+                ) or (entry_gap < 0 and current_gap > 0):
+                    logger.warning(
+                        "🚨 Emergency exit triggered | erosion=%.1f%%", erosion * 100
+                    )
+                    await self._settle(market, token, entry_gap, size, forced=True)
+                    return
 
-            # Partial exit at 40 % erosion
-            if not partial_exited and erosion > PARTIAL_EXIT_THRESHOLD:
-                logger.info(
-                    "⚠️  Partial exit (50%%) triggered | erosion=%.1f%%", erosion * 100
-                )
-                partial_size = size * 0.5
-                await self.executor.place_order(
-                    "SELL_PARTIAL", token, PARTIAL_EXIT_PRICE, partial_size
-                )
-                partial_exited = True
-                size = size * 0.5  # remaining size
+                # Partial exit at 40 % erosion
+                if not partial_exited and erosion > PARTIAL_EXIT_THRESHOLD:
+                    logger.info(
+                        "⚠️  Partial exit (50%%) triggered | erosion=%.1f%%", erosion * 100
+                    )
+                    partial_size = size * 0.5
+                    await self.executor.place_order(
+                        "SELL_PARTIAL", token, PARTIAL_EXIT_PRICE, partial_size
+                    )
+                    partial_exited = True
+                    size = size * 0.5  # remaining size
 
-            await asyncio.sleep(SCAN_INTERVAL)
+                await asyncio.sleep(SCAN_INTERVAL)
 
-        # Settlement reached normally
-        await self._settle(market, token, entry_gap, size)
+            # Settlement reached normally
+            await self._settle(market, token, entry_gap, size)
+        finally:
+            # Always release the position slot so the market can be traded again
+            self._active_positions.pop(market_id, None)
+            logger.info("👁️  Position monitoring ended for market %s...", market_id[:20])
 
     async def _settle(
         self,
