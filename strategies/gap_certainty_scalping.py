@@ -553,6 +553,8 @@ class GapCertaintyStrategy:
         self._start_time = datetime.now(timezone.utc)
         # Track markets that currently have an open position
         self._active_positions: Dict[str, Any] = {}
+        # Keep strong references to background monitoring tasks to prevent GC
+        self._monitoring_tasks: set = set()
 
         # CSV logging
         self._csv_path = LOG_DIR / "trades.csv"
@@ -782,8 +784,24 @@ class GapCertaintyStrategy:
 
         logger.info("✅ Position opened: %s %s... @ %.3f", side, token[:20], entry_price)
 
-        # Monitor in a background task so the main loop keeps scanning other markets
-        asyncio.create_task(self._monitor_position(market, token, gap, size))
+        # Monitor in a background task so the main loop keeps scanning other markets.
+        # Keep a strong reference to prevent the task from being garbage-collected before
+        # it completes; the done-callback removes it from the set.
+        task = asyncio.create_task(self._monitor_position(market, token, gap, size))
+        self._monitoring_tasks.add(task)
+
+        def _on_monitor_done(t: asyncio.Task) -> None:
+            self._monitoring_tasks.discard(t)
+            exc = t.exception() if not t.cancelled() else None
+            if exc is not None:
+                logger.error(
+                    "❌ Unhandled exception in _monitor_position for market %s: %s",
+                    market_id[:20],
+                    exc,
+                    exc_info=exc,
+                )
+
+        task.add_done_callback(_on_monitor_done)
 
     def _get_token_id_for_side(
         self,

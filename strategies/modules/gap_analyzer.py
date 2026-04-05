@@ -7,8 +7,14 @@ and Polymarket settlement reference price.
 import logging
 import re
 import time
+import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+
+try:
+    import ccxt as _ccxt
+except ImportError:  # pragma: no cover
+    _ccxt = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +39,8 @@ class GapAnalyzer:
         self._price_cache: dict = {}
         # Cache of reference prices keyed by market condition_id / id
         self._reference_prices: Dict[str, float] = {}
+        # Shared ccxt Binance exchange instance — initialised lazily on first use
+        self._binance_exchange: Optional[Any] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -175,9 +183,13 @@ class GapAnalyzer:
 
         # 4. Fetch historical price at window start from Binance klines
         try:
-            import ccxt  # noqa: PLC0415
+            if _ccxt is None:
+                logger.error("ccxt is not installed — cannot fetch reference price")
+                return None
 
-            exchange = ccxt.binance()
+            if self._binance_exchange is None:
+                self._binance_exchange = _ccxt.binance()
+            exchange = self._binance_exchange
             window_start_ms = int(window_start_ts * 1000)
 
             try:
@@ -202,7 +214,11 @@ class GapAnalyzer:
                     ticker = exchange.fetch_ticker("BTC/USDT")
                     reference_price = float(ticker["last"])
             except Exception as exc:
-                logger.warning("Error fetching klines: %s, using current price", exc)
+                logger.warning(
+                    "Error fetching klines for market %s: %s, using current price",
+                    market_id[:20],
+                    exc,
+                )
                 ticker = exchange.fetch_ticker("BTC/USDT")
                 reference_price = float(ticker["last"])
 
@@ -217,8 +233,6 @@ class GapAnalyzer:
 
         except Exception as exc:
             logger.error("Error getting reference price: %s", exc)
-            import traceback  # noqa: PLC0415
-
             logger.error(traceback.format_exc())
             return None
 
