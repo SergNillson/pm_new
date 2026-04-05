@@ -2,7 +2,7 @@
 Polymarket API Client (no authentication required)
 ====================================================
 Provides async methods for fetching public market data from Polymarket:
-- Active markets (gamma-api)
+- Active BTC 5-minute markets (via /events endpoint)
 - Orderbook depth (CLOB API)
 - Midpoint / last-trade prices
 - Settlement outcomes for resolved markets
@@ -10,7 +10,9 @@ Provides async methods for fetching public market data from Polymarket:
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -65,8 +67,192 @@ class PolymarketAPIClient:
             await self._session.close()
 
     # ------------------------------------------------------------------
-    # Markets
+    # BTC 5-minute markets (using /events endpoint)
     # ------------------------------------------------------------------
+
+    def _get_et_timezone(self):
+        """Get Eastern Time timezone object."""
+        try:
+            from zoneinfo import ZoneInfo  # Python 3.9+
+            return ZoneInfo("America/New_York")
+        except ImportError:
+            try:
+                import pytz  # Fallback for older Python
+                return pytz.timezone("America/New_York")
+            except ImportError:
+                # Manual fallback if neither available
+                # EDT (April-October) = UTC-4, EST (November-March) = UTC-5
+                now_utc = datetime.now(timezone.utc)
+                month = now_utc.month
+                is_dst = 3 < month < 11  # Rough DST check
+                offset_hours = -4 if is_dst else -5
+                return timezone(timedelta(hours=offset_hours))
+
+    def _get_current_5m_window_timestamp(self) -> int:
+        """Calculate the Unix timestamp for the CURRENT active 5-minute window end time in ET."""
+        et_tz = self._get_et_timezone()
+        now_et = datetime.now(et_tz)
+        minute = now_et.minute
+
+        # Calculate the end of the current 5-minute window
+        # If it's 2:12 PM, we want the window ending at 2:15 PM
+        current_window_end_minute = ((minute // 5) + 1) * 5
+        
+        window_end = now_et.replace(minute=0, second=0, microsecond=0)
+        window_end += timedelta(minutes=current_window_end_minute)
+
+        return int(window_end.timestamp())
+
+    async def fetch_btc_5min_market(self) -> Optional[Dict[str, Any]]:
+        """
+        Fetch current BTC 5-min market using /events endpoint with calculated slug.
+
+        This method calculates the current 5-minute window timestamp in ET timezone
+        and queries the Gamma API /events endpoint directly with the slug pattern:
+        "btc-updown-5m-{timestamp}"
+
+        Returns:
+            Market dict containing:
+            - id: condition_id
+            - condition_id: market condition ID
+            - question: market title
+            - slug: event slug
+            - end_date_iso: ISO timestamp when market closes
+            - tokens: list of token IDs [up_token, down_token]
+            - outcomes: list of outcome names ["Up", "Down"]
+            - accepting_orders: boolean
+            - active: boolean
+            - closed: boolean
+
+            Returns None if no active market found.
+        """
+        try:
+            et_tz = self._get_et_timezone()
+            now_et = datetime.now(et_tz)
+            now_utc = datetime.now(timezone.utc)
+            
+            # Calculate current 5-min window end timestamp
+            current_ts = self._get_current_5m_window_timestamp()
+
+            logger.debug(
+                f"🔍 Looking for BTC 5-min market | "
+                f"ET time: {now_et.strftime('%H:%M:%S')} | "
+                f"Window end timestamp: {current_ts}"
+            )
+
+            # Try previous, current, and next windows
+            # Previous = currently active market (close to settlement)
+            # Current = next market about to start
+            # Next = future market
+            for offset, label in [(-300, "previous"), (0, "current"), (300, "next")]:
+                ts = current_ts + offset
+                slug = f"btc-updown-5m-{ts}"
+
+                logger.debug(f"   Trying {label} window: {slug}")
+
+                session = await self._get_session()
+                url = f"{GAMMA_API_BASE}/events"
+
+                async with session.get(url, params={"slug": slug}) as resp:
+                    if resp.status != 200:
+                        logger.debug(f"   Status {resp.status} for {slug}")
+                        continue
+
+                    data = await resp.json()
+
+                    # Parse response (can be list or dict)
+                    if isinstance(data, list) and len(data) > 0:
+                        event = data[0]
+                    elif isinstance(data, dict):
+                        event = data
+                    else:
+                        logger.debug(f"   Unexpected data format for {slug}")
+                        continue
+
+                    # Check if closed
+                    if event.get("closed", False):
+                        logger.debug(f"   Market is closed: {slug}")
+                        continue
+
+                    # Check time until settlement
+                    end_date_str = event.get("endDate", "")
+                    time_until_settlement = None
+                    
+                    if end_date_str:
+                        try:
+                            end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                            time_until_settlement = (end_date - now_utc).total_seconds()
+                            
+                            logger.debug(
+                                f"   Time until settlement: {time_until_settlement:.0f}s "
+                                f"({time_until_settlement / 60:.1f} min)"
+                            )
+                        except Exception as exc:
+                            logger.debug(f"   Could not parse endDate: {exc}")
+
+                    logger.info(
+                        f"✅ Found {label} BTC 5-min market: {event.get('title', 'N/A')} "
+                        f"(settlement in {time_until_settlement:.0f}s)" if time_until_settlement else 
+                        f"✅ Found {label} BTC 5-min market: {event.get('title', 'N/A')}"
+                    )
+
+                    # Parse market data
+                    markets = event.get("markets", [])
+                    if not markets:
+                        logger.warning(f"   ❌ No markets in event: {slug}")
+                        continue
+
+                    market = markets[0]
+
+                    # Extract token IDs (stored as JSON string)
+                    clob_token_ids_str = market.get("clobTokenIds", "[]")
+                    try:
+                        tokens = json.loads(clob_token_ids_str)
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        logger.error(f"   ❌ Could not parse clobTokenIds: {exc}")
+                        continue
+
+                    # Extract outcomes (stored as JSON string)
+                    outcomes_str = market.get("outcomes", "[]")
+                    try:
+                        outcomes = json.loads(outcomes_str)
+                    except (json.JSONDecodeError, TypeError) as exc:
+                        logger.error(f"   ❌ Could not parse outcomes: {exc}")
+                        continue
+
+                    if len(tokens) < 2:
+                        logger.error(f"   ❌ Not enough token IDs: {len(tokens)}")
+                        continue
+
+                    if len(outcomes) < 2:
+                        logger.error(f"   ❌ Not enough outcomes: {len(outcomes)}")
+                        continue
+
+                    logger.debug(f"   Token IDs: {tokens[0][:20]}..., {tokens[1][:20]}...")
+                    logger.debug(f"   Outcomes: {outcomes}")
+
+                    return {
+                        "id": market.get("conditionId", ""),
+                        "condition_id": market.get("conditionId", ""),
+                        "question": event.get("title", ""),
+                        "slug": slug,
+                        "end_date_iso": end_date_str,
+                        "endDate": end_date_str,
+                        "tokens": tokens,
+                        "outcomes": outcomes,
+                        "accepting_orders": market.get("acceptingOrders", True),
+                        "active": event.get("active", True),
+                        "closed": event.get("closed", False),
+                    }
+
+            logger.warning("⚠️ No active BTC 5-min market found in any window")
+            return None
+
+        except Exception as exc:
+            logger.warning(f"⚠️ fetch_btc_5min_market failed: {exc}")
+            import traceback
+            logger.debug(traceback.format_exc())
+            return None
 
     async def fetch_markets(
         self,
@@ -77,6 +263,9 @@ class PolymarketAPIClient:
         """
         Fetch markets from the Gamma API.
 
+        NOTE: For BTC 5-minute markets, use fetch_btc_5min_market() instead,
+        as the /markets endpoint does not reliably return these short-term markets.
+
         Args:
             keyword:     Case-insensitive filter applied to the question text.
             active_only: When True, only open / active markets are returned.
@@ -86,6 +275,12 @@ class PolymarketAPIClient:
             A list of market dicts containing at least:
             ``id``, ``question``, ``condition_id``, ``tokens``, ``end_date_iso``.
         """
+        # For BTC 5-min markets, redirect to the specialized endpoint
+        if keyword.upper() == "BTC":
+            logger.info("🔀 Redirecting to fetch_btc_5min_market() for BTC markets")
+            market = await self.fetch_btc_5min_market()
+            return [market] if market else []
+
         params: Dict[str, Any] = {
             "limit": limit,
             "active": "true" if active_only else "false",
@@ -104,10 +299,23 @@ class PolymarketAPIClient:
             # Filter locally to the keyword
             if keyword:
                 kw = keyword.upper()
+
+                # Multi-language support
+                crypto_keywords = {
+                    "BTC": ["BTC", "BITCOIN", "БИТКОИН", "比特币"],
+                    "ETH": ["ETH", "ETHEREUM", "ЭФИРИУМ", "以太坊"],
+                }
+
+                search_terms = crypto_keywords.get(kw, [kw])
+
                 markets = [
-                    m for m in markets
-                    if kw in m.get("question", "").upper()
-                    or kw in m.get("slug", "").upper()
+                    m
+                    for m in markets
+                    if any(
+                        term in m.get("question", "").upper()
+                        or term in m.get("slug", "").upper()
+                        for term in search_terms
+                    )
                 ]
 
             logger.info(
@@ -120,86 +328,6 @@ class PolymarketAPIClient:
         except Exception as exc:
             logger.warning("⚠️  fetch_markets failed: %s", exc)
             return []
-
-    async def fetch_btc_5min_market(self) -> List[Dict[str, Any]]:
-        """
-        Fetch Bitcoin Up-or-Down 5-minute markets from Polymarket.
-
-        Tries the ``/events`` endpoint first (which groups related markets under
-        an event), then falls back to the ``/markets`` endpoint with the keyword
-        "Bitcoin".  The "Bitcoin Up or Down" 5-minute markets use "Bitcoin" in
-        their title, not the abbreviation "BTC", which is why a plain
-        keyword="BTC" search returns zero results.
-
-        Returns:
-            List of market dicts (same shape as :meth:`fetch_markets`).
-        """
-        logger.info("🔀 Redirecting to fetch_btc_5min_market() for BTC markets")
-
-        # ------------------------------------------------------------------
-        # Attempt 1: /events endpoint
-        # ------------------------------------------------------------------
-        try:
-            session = await self._get_session()
-            url = f"{GAMMA_API_BASE}/events"
-            params: Dict[str, Any] = {
-                "active": "true",
-                "archived": "false",
-                "limit": 100,
-            }
-            async with session.get(url, params=params) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-
-            events = data if isinstance(data, list) else data.get("events", [])
-
-            # Keep only Bitcoin-related events
-            btc_events = [
-                e for e in events
-                if "bitcoin" in e.get("title", "").lower()
-                or "bitcoin" in e.get("slug", "").lower()
-                or "btc" in e.get("title", "").lower()
-                or "btc" in e.get("slug", "").lower()
-            ]
-
-            markets: List[Dict[str, Any]] = []
-            for event in btc_events:
-                for mkt in event.get("markets", []):
-                    markets.append(mkt)
-
-            if markets:
-                logger.info(
-                    "✅ Found %d BTC 5-min market(s) via /events", len(markets)
-                )
-                return markets
-
-        except Exception as exc:
-            logger.warning(
-                "⚠️  fetch_btc_5min_market via /events failed: %s — trying /markets",
-                exc,
-            )
-
-        # ------------------------------------------------------------------
-        # Attempt 2: /markets with "Bitcoin" keyword
-        # ------------------------------------------------------------------
-        markets = await self.fetch_markets(keyword="Bitcoin", active_only=True)
-        if markets:
-            logger.info(
-                "✅ Found %d BTC 5-min market(s) via /markets (keyword=Bitcoin)",
-                len(markets),
-            )
-            return markets
-
-        # ------------------------------------------------------------------
-        # Attempt 3: /markets with "Up or Down" keyword
-        # ------------------------------------------------------------------
-        markets = await self.fetch_markets(keyword="Up or Down", active_only=True)
-        if markets:
-            logger.info(
-                "✅ Found %d BTC 5-min market(s) via /markets (keyword='Up or Down')",
-                len(markets),
-            )
-        return markets
 
     # ------------------------------------------------------------------
     # Orderbook
@@ -233,14 +361,18 @@ class PolymarketAPIClient:
             bids = book.get("bids", [])
             logger.debug(
                 "📖 [CLOB] Orderbook for %s — %d asks / %d bids",
-                token_id,
+                token_id[:20] + "..." if len(token_id) > 20 else token_id,
                 len(asks),
                 len(bids),
             )
             return book
 
         except Exception as exc:
-            logger.warning("⚠️  fetch_orderbook(%s) failed: %s", token_id, exc)
+            logger.warning(
+                "⚠️  fetch_orderbook(%s) failed: %s", 
+                token_id[:20] + "..." if len(token_id) > 20 else token_id, 
+                exc
+            )
             return {"asks": [], "bids": []}
 
     # ------------------------------------------------------------------
@@ -262,11 +394,19 @@ class PolymarketAPIClient:
                 data = await resp.json()
 
             mid = float(data.get("mid", 0) or 0)
-            logger.debug("💲 [CLOB] Midpoint for %s = %.4f", token_id, mid)
+            logger.debug(
+                "💲 [CLOB] Midpoint for %s = %.4f", 
+                token_id[:20] + "..." if len(token_id) > 20 else token_id, 
+                mid
+            )
             return mid if mid > 0 else None
 
         except Exception as exc:
-            logger.warning("⚠️  fetch_midpoint(%s) failed: %s", token_id, exc)
+            logger.warning(
+                "⚠️  fetch_midpoint(%s) failed: %s", 
+                token_id[:20] + "..." if len(token_id) > 20 else token_id, 
+                exc
+            )
             return None
 
     # ------------------------------------------------------------------
@@ -288,11 +428,19 @@ class PolymarketAPIClient:
                 data = await resp.json()
 
             price = float(data.get("price", 0) or 0)
-            logger.debug("🔄 [CLOB] Last-trade price for %s = %.4f", token_id, price)
+            logger.debug(
+                "🔄 [CLOB] Last-trade price for %s = %.4f", 
+                token_id[:20] + "..." if len(token_id) > 20 else token_id, 
+                price
+            )
             return price if price > 0 else None
 
         except Exception as exc:
-            logger.warning("⚠️  fetch_last_trade_price(%s) failed: %s", token_id, exc)
+            logger.warning(
+                "⚠️  fetch_last_trade_price(%s) failed: %s", 
+                token_id[:20] + "..." if len(token_id) > 20 else token_id, 
+                exc
+            )
             return None
 
     # ------------------------------------------------------------------
@@ -344,11 +492,15 @@ class PolymarketAPIClient:
             }
             logger.info(
                 "🏁 [Gamma API] Market %s RESOLVED — settlement_price=%.2f",
-                condition_id,
+                condition_id[:20] + "..." if len(condition_id) > 20 else condition_id,
                 settlement_price,
             )
             return result
 
         except Exception as exc:
-            logger.warning("⚠️  fetch_settlement(%s) failed: %s", condition_id, exc)
+            logger.warning(
+                "⚠️  fetch_settlement(%s) failed: %s", 
+                condition_id[:20] + "..." if len(condition_id) > 20 else condition_id, 
+                exc
+            )
             return None

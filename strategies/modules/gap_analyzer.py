@@ -129,9 +129,7 @@ class GapAnalyzer:
 
         # 1. Return cached reference price
         if market_id in self._reference_prices:
-            ref = self._reference_prices[market_id]
-            logger.debug("Using cached reference price for %s: $%s", market_id, f"{ref:,.2f}")
-            return ref
+            return self._reference_prices[market_id]
 
         # 2. Determine window_start from endDate (endDate - 5 minutes)
         end_date_str = (
@@ -249,16 +247,13 @@ class GapAnalyzer:
             logger.debug("No reference price available — cannot check momentum+gap signal")
             return None
 
-        # LOG: Reference price
-        logger.info("📍 Reference price: $%s", f"{reference_price:,.2f}")
-
         # 2. Calculate gap
         gap = current_btc_price - reference_price
         logger.info(
-            "📊 Gap analysis: BTC $%s - Ref $%s = $%+.2f",
-            f"{current_btc_price:,.2f}",
-            f"{reference_price:,.2f}",
+            "📊 Gap analysis: $%+.2f | Up: %.3f Down: %.3f",
             gap,
+            up_token_price,
+            down_token_price,
         )
 
         # 3. Calculate time left
@@ -285,19 +280,20 @@ class GapAnalyzer:
             return None
 
         logger.info(
-            "⏰ Time window check: %.0fs left (range: %.0f-%.0fs)",
+            "⏰ Time check: %.0fs (range: %.0f-%.0fs)",
             time_left,
             min_time_left,
             max_time_left,
         )
 
         # 4. Time window check
-        if time_left > max_time_left:
-            logger.info("❌ Too early: %.0fs > %.0fs", time_left, max_time_left)
-            return None
-
-        if time_left < min_time_left:
-            logger.info("❌ Too late: %.0fs < %.0fs", time_left, min_time_left)
+        if not (min_time_left <= time_left <= max_time_left):
+            logger.debug(
+                "Time left %.0fs outside entry window [%.0f, %.0f]s",
+                time_left,
+                min_time_left,
+                max_time_left,
+            )
             return None
 
         # 5. Check UP signal (gap positive + up token confident)
@@ -313,13 +309,6 @@ class GapAnalyzer:
                 "time_left": time_left,
                 "expected_profit_pct": expected_profit_pct,
             }
-            logger.info(
-                "✅ UP signal conditions met: gap $%+.2f >= $%.2f, up_price %.3f >= %.3f",
-                gap,
-                min_gap,
-                up_token_price,
-                min_token_price_threshold,
-            )
             logger.info(
                 "🎯 SIGNAL FOUND: UP @ %.3f (gap $%+.2f)",
                 up_token_price,
@@ -341,25 +330,16 @@ class GapAnalyzer:
                 "expected_profit_pct": expected_profit_pct,
             }
             logger.info(
-                "✅ DOWN signal conditions met: gap $%+.2f <= $%.2f, down_price %.3f >= %.3f",
-                gap,
-                -min_gap,
-                down_token_price,
-                min_token_price_threshold,
-            )
-            logger.info(
                 "🎯 SIGNAL FOUND: DOWN @ %.3f (gap $%+.2f)",
                 down_token_price,
                 gap,
             )
             return signal
 
-        logger.info(
-            "❌ No signal: gap=$%+.2f (need gap >= $%.2f or gap <= $%.2f), "
-            "Up=%.3f Down=%.3f (need >= %.3f)",
+        logger.debug(
+            "No momentum+gap signal: gap=$%+.2f (min $%.2f), up=%.3f, down=%.3f (min %.2f)",
             gap,
             min_gap,
-            -min_gap,
             up_token_price,
             down_token_price,
             min_token_price_threshold,

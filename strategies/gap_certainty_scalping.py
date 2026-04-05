@@ -551,7 +551,6 @@ class GapCertaintyStrategy:
         self._paused_until: float = 0.0
         self._daily_start_bankroll = capital
         self._start_time = datetime.now(timezone.utc)
-        self._active_positions: Dict[str, Any] = {}  # Track active positions by market_id
 
         # CSV logging
         self._csv_path = LOG_DIR / "trades.csv"
@@ -598,12 +597,10 @@ class GapCertaintyStrategy:
     # ------------------------------------------------------------------
 
     async def _main_loop(self) -> None:
-        logger.info("🔄 Main loop started")
         logger.info("📊 Scanning BTC 5-min markets...")
 
         while self._running:
             now = time.time()
-            logger.debug("--- New scan iteration ---")
 
             # Respect pause period after consecutive losses
             if now < self._paused_until:
@@ -630,28 +627,10 @@ class GapCertaintyStrategy:
 
             # Scan markets
             markets = await self._get_active_markets()
-
-            if not markets:
-                logger.debug("No markets found, waiting...")
-                await asyncio.sleep(SCAN_INTERVAL)
-                continue
-
-            logger.debug("Analyzing %d market(s)", len(markets))
-
-            for i, market in enumerate(markets, 1):
-                logger.debug("--- Market %d/%d ---", i, len(markets))
-                try:
+            for market in markets:
+                time_left = market["settlement_time"] - now
+                if ENTRY_WINDOW_LOW <= time_left <= ENTRY_WINDOW_HIGH:
                     await self._check_entry_signal(market, current_btc_price, current_vol)
-                except Exception as exc:
-                    import traceback as _tb  # noqa: PLC0415
-
-                    logger.error(
-                        "Error checking signal for market %d (%s): %s",
-                        i,
-                        market.get("id", "?"),
-                        exc,
-                    )
-                    logger.error(_tb.format_exc())
 
             await asyncio.sleep(SCAN_INTERVAL)
 
@@ -667,20 +646,7 @@ class GapCertaintyStrategy:
     ) -> None:
         """Evaluate market for a Momentum + Gap trading signal."""
         market_id = market.get("condition_id", market.get("id", ""))
-        question = market.get("question", "Unknown market")
-
-        # LOG 1: Start of analysis
-        logger.info("🔍 Analyzing market: %s...", question[:60])
-
-        # Skip if already have an open position for this market
-        if market_id in self._active_positions:
-            logger.info("⏭️  Skip: Already have position for %s...", market_id[:20])
-            return
-
         time_left_seconds = int(market["settlement_time"] - time.time())
-
-        # LOG 2: Time check
-        logger.info("⏰ Time until settlement: %ds", time_left_seconds)
 
         # Seed reference price on first observation for Up/Down markets that
         # lack an explicit strike.  Synthetic dry-run markets already carry a
@@ -690,11 +656,7 @@ class GapCertaintyStrategy:
 
         # Get Up/Down token prices from orderbook
         if self.paper_trading and self.paper_engine is not None:
-            try:
-                token_prices = await self.paper_engine.get_token_prices(market)
-            except Exception as exc:
-                logger.error("❌ Failed to get token prices: %s", exc)
-                return
+            token_prices = await self.paper_engine.get_token_prices(market)
         else:
             # In dry-run / live mode: derive implied prices from the gap.
             # Using named constants avoids magic numbers in the simulation.
@@ -716,42 +678,29 @@ class GapCertaintyStrategy:
         up_price = token_prices.get("up", 0.5)
         down_price = token_prices.get("down", 0.5)
 
-        # LOG 3: Current BTC price
-        logger.info("📈 Current BTC price: $%s", f"{btc_price:,.2f}")
-
         logger.debug(
             "Market %s... | Time left: %ds | Up: %.3f Down: %.3f",
-            question[:50],
+            market.get("question", market_id)[:50],
             time_left_seconds,
             up_price,
             down_price,
         )
 
         # Check Momentum + Gap signal
-        try:
-            signal = self.gap_analyzer.check_momentum_gap_signal(
-                market_data=market,
-                current_btc_price=btc_price,
-                up_token_price=up_price,
-                down_token_price=down_price,
-                min_token_price_threshold=self.config.get("entry", {}).get("min_token_price", 0.75),
-                min_gap=self.min_gap,
-                max_time_left=self.config.get("entry", {}).get("max_time_left", ENTRY_WINDOW_HIGH),
-                min_time_left=self.config.get("entry", {}).get("min_time_left", ENTRY_WINDOW_LOW),
-            )
-        except Exception as exc:
-            import traceback as _tb  # noqa: PLC0415
+        signal = self.gap_analyzer.check_momentum_gap_signal(
+            market_data=market,
+            current_btc_price=btc_price,
+            up_token_price=up_price,
+            down_token_price=down_price,
+            min_token_price_threshold=self.config.get("entry", {}).get("min_token_price", 0.75),
+            min_gap=self.min_gap,
+            max_time_left=self.config.get("entry", {}).get("max_time_left", ENTRY_WINDOW_HIGH),
+            min_time_left=self.config.get("entry", {}).get("min_time_left", ENTRY_WINDOW_LOW),
+        )
 
-            logger.error("❌ Error in signal analysis: %s", exc)
-            logger.error(_tb.format_exc())
-            return
-
-        # LOG 4: Signal result
         if signal is None:
-            logger.info("❌ No signal - conditions not met")
-            return
+            return  # No signal
 
-        # LOG 5: Signal found
         logger.info(
             "🎯 MOMENTUM+GAP SIGNAL | "
             "Side: %s | "
@@ -775,13 +724,6 @@ class GapCertaintyStrategy:
             signal["time_left"],
         )
 
-        # LOG 6: Position size
-        logger.info(
-            "💰 Position size calculated: $%.2f (%.1f%% of capital)",
-            size,
-            (size / self.capital) * 100,
-        )
-
         # Enter position
         await self._enter_position_momentum(market, signal, size)
 
@@ -794,9 +736,6 @@ class GapCertaintyStrategy:
         """
         Enter a position based on a Momentum + Gap signal.
 
-        Creates position tracking and starts an async monitoring task.
-        Does NOT block the main loop.
-
         Args:
             market: Market data dict.
             signal: Signal dict from ``check_momentum_gap_signal()``.
@@ -805,7 +744,6 @@ class GapCertaintyStrategy:
         side = signal["side"]
         entry_price = signal["entry_price"]
         gap = signal["gap"]
-        market_id = market.get("condition_id", market.get("id", ""))
 
         logger.info(
             "📈 ENTERING %s POSITION | size=$%.2f (%.1f%%) | price=%.3f | gap=$%+.2f",
@@ -831,202 +769,7 @@ class GapCertaintyStrategy:
         else:
             await self.executor.place_order(side, token, entry_price, size, gap=gap)
 
-        # Create position tracking record
-        position: Dict[str, Any] = {
-            "market_id": market_id,
-            "token_id": token,
-            "side": side,
-            "size_usd": size,
-            "entry_price": entry_price,
-            "entry_time": time.time(),
-            "entry_gap": gap,
-            "settlement_time": market.get(
-                "settlement_time",
-                time.time() + signal.get("time_left", 60),
-            ),
-        }
-
-        # Store in active positions
-        self._active_positions[market_id] = position
-
-        logger.info(
-            "✅ Position opened: %s %s... @ %.3f",
-            side,
-            token[:20],
-            entry_price,
-        )
-
-        # Launch background monitoring task — does NOT block the main loop
-        asyncio.create_task(self._monitor_position_momentum(market, position, signal))
-
-    async def _monitor_position_momentum(
-        self,
-        market: Dict[str, Any],
-        position: Dict[str, Any],
-        signal: Dict[str, Any],
-    ) -> None:
-        """
-        Monitor an open position until settlement.
-
-        Runs as an async background task so the main loop is never blocked.
-        Implements risk management:
-        - Emergency exit if gap reverses direction.
-        - 50 % partial exit if gap erodes more than 40 %.
-        """
-        market_id = position["market_id"]
-        settlement_time = position["settlement_time"]
-        entry_gap = position["entry_gap"]
-        side = position["side"]
-
-        logger.info("👁️  Monitoring %s position until settlement...", side)
-
-        try:
-            while time.time() < settlement_time and self._running:
-                try:
-                    current_btc = await self._get_btc_price()
-                except Exception as exc:
-                    logger.warning("Could not get BTC price: %s", exc)
-                    await asyncio.sleep(1)
-                    continue
-
-                current_gap = self.gap_analyzer.get_current_gap(
-                    market_id,
-                    current_btc,
-                    market_data=market,
-                )
-
-                erosion = (
-                    abs(current_gap - entry_gap) / abs(entry_gap)
-                    if entry_gap != 0
-                    else 0.0
-                )
-
-                time_left = settlement_time - time.time()
-                if time_left > 0 and int(time_left) % 10 == 0:
-                    logger.info(
-                        "📊 Position: %s | Gap: $%+.2f (entry: $%+.2f) | "
-                        "Erosion: %.1f%% | Time left: %.0fs",
-                        side,
-                        current_gap,
-                        entry_gap,
-                        erosion * 100,
-                        time_left,
-                    )
-
-                # Emergency exit if gap reversed direction
-                if (side == "UP" and current_gap < 0) or (
-                    side == "DOWN" and current_gap > 0
-                ):
-                    logger.warning(
-                        "⚠️  GAP REVERSED! Entry: $%+.2f → Current: $%+.2f",
-                        entry_gap,
-                        current_gap,
-                    )
-                    logger.warning(
-                        "🚨 EMERGENCY EXIT at %.1f%% erosion", erosion * 100
-                    )
-                    await self._close_position_momentum(
-                        market, position, current_btc, emergency=True
-                    )
-                    return
-
-                # Partial exit if erosion > 40 %
-                if (
-                    erosion > PARTIAL_EXIT_THRESHOLD
-                    and not position.get("partial_exited", False)
-                ):
-                    logger.warning(
-                        "⚠️  Gap eroding: $%+.2f → $%+.2f (%.1f%%)",
-                        entry_gap,
-                        current_gap,
-                        erosion * 100,
-                    )
-                    logger.info("📉 Reducing position by 50%%")
-                    position["size_usd"] *= 0.5
-                    position["partial_exited"] = True
-
-                await asyncio.sleep(1)
-
-            # Settlement reached
-            logger.info("🏁 Settlement reached for %s position", side)
-            final_btc = await self._get_btc_price()
-            await self._close_position_momentum(market, position, final_btc)
-
-        except Exception as exc:
-            import traceback as tb  # noqa: PLC0415
-
-            logger.error("❌ Error monitoring position: %s", exc)
-            logger.error(tb.format_exc())
-            # Clean up the position record so the market can be re-entered
-            self._active_positions.pop(market_id, None)
-
-    async def _close_position_momentum(
-        self,
-        market: Dict[str, Any],
-        position: Dict[str, Any],
-        final_btc_price: float,
-        emergency: bool = False,
-    ) -> None:
-        """
-        Close a position and calculate realised P&L.
-
-        Args:
-            market:           Market data dict.
-            position:         Position tracking dict.
-            final_btc_price:  BTC price at close time.
-            emergency:        True if this is a forced emergency exit.
-        """
-        market_id = position["market_id"]
-        side = position["side"]
-        size = position["size_usd"]
-        entry_price = position["entry_price"]
-        entry_gap = position["entry_gap"]
-
-        # Final gap determines outcome
-        final_gap = self.gap_analyzer.get_current_gap(
-            market_id, final_btc_price, market_data=market
-        )
-
-        won = final_gap > 0 if side == "UP" else final_gap < 0
-
-        if won:
-            gross_pnl = size * (1.0 - entry_price)
-            logger.info("🎉 WIN! Gap: $%+.2f | Side: %s", final_gap, side)
-        else:
-            gross_pnl = -(size * entry_price)
-            logger.info("😞 LOSS! Gap: $%+.2f | Side: %s", final_gap, side)
-
-        # Apply 0.2 % trading fee
-        fees = size * 0.002
-        net_pnl = gross_pnl - fees
-
-        # Update running capital
-        self.capital += net_pnl
-
-        # Update position sizer
-        self.sizer.update_after_trade(net_pnl, won)
-
-        # Log to CSV
-        self._log_trade_csv(market, entry_gap, size, net_pnl, won, emergency)
-
-        logger.info(
-            "💰 P&L: $%+.2f (gross: $%+.2f, fees: $%.2f) | New capital: $%.2f",
-            net_pnl,
-            gross_pnl,
-            fees,
-            self.capital,
-        )
-
-        # Risk circuit breaker
-        if self.sizer.consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-            self._paused_until = time.time() + PAUSE_DURATION
-            logger.warning(
-                "⛔ %d consecutive losses — pausing for 1 hour.",
-                MAX_CONSECUTIVE_LOSSES,
-            )
-
-        # Remove from active positions
-        self._active_positions.pop(market_id, None)
+        await self._monitor_position(market, token, gap, size)
 
     def _get_token_id_for_side(
         self,
