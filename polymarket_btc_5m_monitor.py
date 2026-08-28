@@ -273,7 +273,11 @@ def print_status(market: Optional[Market], prices: Prices) -> None:
         print("Waiting for an active BTC 5m market...", flush=True)
         return
     remaining = max(0.0, market.end.timestamp() - time.time())
-    difference = ((prices.btc - market.target) / market.target * 100) if prices.btc and market.target else None
+    difference = (
+        (prices.btc - market.target) / market.target * 100
+        if prices.btc is not None and market.target not in (None, 0)
+        else None
+    )
     difference_text = f"{difference:+.3f}%" if difference is not None else "n/a"
     target_text = market.target if market.target is not None else "n/a"
     btc_text = prices.btc if prices.btc is not None else "n/a"
@@ -299,17 +303,26 @@ async def main() -> None:
         while True:
             try:
                 market = await asyncio.to_thread(fetch_active_market)
-                if market is None or market_ref[0] is None or market.slug != market_ref[0].slug:
-                    market_ref[0] = market
+                market_ref[0] = market
             except (requests.RequestException, ValueError, TypeError) as exc:
                 print(f"Gamma API error: {exc}", flush=True)
             print_status(market_ref[0], prices)
             await asyncio.sleep(2)
 
+    async def supervise(coro_factory, name: str) -> None:
+        while True:
+            try:
+                await coro_factory()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                print(f"{name} client error: {exc}", flush=True)
+                await asyncio.sleep(2)
+
     tasks = [
-        asyncio.create_task(PolymarketPriceClient(prices).run()),
-        asyncio.create_task(ClobPriceClient(prices, market_ref).run()),
-        asyncio.create_task(poll_market()),
+        asyncio.create_task(supervise(PolymarketPriceClient(prices).run, "BTC price")),
+        asyncio.create_task(supervise(lambda: ClobPriceClient(prices, market_ref).run(), "CLOB")),
+        asyncio.create_task(supervise(poll_market, "Gamma")),
     ]
     await asyncio.gather(*tasks)
 
