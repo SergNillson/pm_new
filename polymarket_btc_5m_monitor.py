@@ -285,7 +285,7 @@ def print_status(market: Optional[Market], prices: Prices) -> None:
     down_text = prices.tokens["down"] if prices.tokens["down"] is not None else "n/a"
     signal = (
         "n/a"
-        if prices.btc is None or market.target is None
+        if prices.btc is None or market.target in (None, 0.0)
         else "UP" if prices.btc >= market.target else "DOWN"
     )
     print(
@@ -319,9 +319,11 @@ async def main() -> None:
                 print(f"{name} client error: {exc}", flush=True)
                 await asyncio.sleep(2)
 
+    btc_client = PolymarketPriceClient(prices)
+    clob_client = ClobPriceClient(prices, market_ref)
     tasks = [
-        asyncio.create_task(supervise(PolymarketPriceClient(prices).run, "BTC price")),
-        asyncio.create_task(supervise(lambda: ClobPriceClient(prices, market_ref).run(), "CLOB")),
+        asyncio.create_task(supervise(btc_client.run, "BTC price")),
+        asyncio.create_task(supervise(clob_client.run, "CLOB")),
         asyncio.create_task(supervise(poll_market, "Gamma")),
     ]
     await asyncio.gather(*tasks)
