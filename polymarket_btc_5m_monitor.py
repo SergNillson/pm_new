@@ -276,6 +276,8 @@ class ClobPriceClient:
         ask_values = [price for price in (_price_from_level(x) for x in asks) if price is not None]
         bid = max(bid_values, default=None)
         ask = min(ask_values, default=None)
+        if bid is not None and ask is not None and bid > ask:
+            return None
         return (
             (bid + ask) / 2
             if bid is not None and ask is not None
