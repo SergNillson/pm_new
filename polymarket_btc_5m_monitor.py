@@ -8,7 +8,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Coroutine, Iterable, Optional
 
 import requests
 import websockets
@@ -191,7 +191,10 @@ class PolymarketPriceClient:
                 data = data[0] if data else {}
             if not isinstance(data, dict):
                 continue
-            value = data.get("price") or data.get("value") or data.get("mid")
+            value = next(
+                (data[key] for key in ("price", "value", "mid") if data.get(key) is not None),
+                None,
+            )
             try:
                 if value is not None:
                     self.prices.btc = float(value)
@@ -248,9 +251,17 @@ class ClobPriceClient:
                 side = next((name for name, token in market.tokens.items() if token == asset), None)
                 if not side:
                     continue
-                price = self._book_price(entry) if event_type == "book" else (
-                    entry.get("price") or entry.get("last_trade_price") or entry.get("best_bid")
-                )
+                if event_type == "book":
+                    price = self._book_price(entry)
+                else:
+                    price = next(
+                        (
+                            entry[key]
+                            for key in ("price", "last_trade_price", "best_bid")
+                            if entry.get(key) is not None
+                        ),
+                        None,
+                    )
                 try:
                     if price is not None:
                         self.prices.tokens[side] = float(price)
@@ -301,6 +312,7 @@ async def main() -> None:
 
     async def poll_market() -> None:
         while True:
+            market = market_ref[0]
             try:
                 market = await asyncio.to_thread(fetch_active_market)
                 market_ref[0] = market
@@ -309,7 +321,9 @@ async def main() -> None:
             print_status(market_ref[0], prices)
             await asyncio.sleep(2)
 
-    async def supervise(coro_factory, name: str) -> None:
+    async def supervise(
+        coro_factory: Callable[[], Coroutine[Any, Any, None]], name: str
+    ) -> None:
         while True:
             try:
                 await coro_factory()
