@@ -211,6 +211,9 @@ class ClobPriceClient:
                     while True:
                         market = self.market_ref[0]
                         ids = tuple(market.tokens.values()) if market else ()
+                        if not market and self._subscribed:
+                            self._subscribed = ()
+                            self.prices.tokens = {"up": None, "down": None}
                         if ids and ids != self._subscribed:
                             await socket.send(json.dumps({"type": "market", "assets_ids": list(ids)}))
                             self._subscribed = ids
@@ -272,6 +275,10 @@ def print_status(market: Optional[Market], prices: Prices) -> None:
     remaining = max(0.0, market.end.timestamp() - time.time())
     difference = ((prices.btc - market.target) / market.target * 100) if prices.btc and market.target else None
     difference_text = f"{difference:+.3f}%" if difference is not None else "n/a"
+    target_text = market.target if market.target is not None else "n/a"
+    btc_text = prices.btc if prices.btc is not None else "n/a"
+    up_text = prices.tokens["up"] if prices.tokens["up"] is not None else "n/a"
+    down_text = prices.tokens["down"] if prices.tokens["down"] is not None else "n/a"
     signal = (
         "n/a"
         if prices.btc is None or market.target is None
@@ -279,28 +286,32 @@ def print_status(market: Optional[Market], prices: Prices) -> None:
     )
     print(
         f"{market.slug} | end {market.end.isoformat()} | {remaining:5.1f}s | "
-        f"target {market.target or 'n/a'} | BTC {prices.btc or 'n/a'} | "
-        f"Δ {difference_text} | Up {prices.tokens['up'] or 'n/a'} | "
-        f"Down {prices.tokens['down'] or 'n/a'} | {signal}",
+        f"target {target_text} | BTC {btc_text} | Δ {difference_text} | "
+        f"Up {up_text} | Down {down_text} | {signal}",
         flush=True,
     )
 
 
 async def main() -> None:
     prices, market_ref = Prices(), [None]
+
+    async def poll_market() -> None:
+        while True:
+            try:
+                market = await asyncio.to_thread(fetch_active_market)
+                if market is None or market_ref[0] is None or market.slug != market_ref[0].slug:
+                    market_ref[0] = market
+            except (requests.RequestException, ValueError, TypeError) as exc:
+                print(f"Gamma API error: {exc}", flush=True)
+            print_status(market_ref[0], prices)
+            await asyncio.sleep(2)
+
     tasks = [
         asyncio.create_task(PolymarketPriceClient(prices).run()),
         asyncio.create_task(ClobPriceClient(prices, market_ref).run()),
+        asyncio.create_task(poll_market()),
     ]
-    while True:
-        try:
-            market = await asyncio.to_thread(fetch_active_market)
-            if market is None or market_ref[0] is None or market.slug != market_ref[0].slug:
-                market_ref[0] = market
-        except (requests.RequestException, ValueError, TypeError) as exc:
-            print(f"Gamma API error: {exc}", flush=True)
-        print_status(market_ref[0], prices)
-        await asyncio.sleep(2)
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":
