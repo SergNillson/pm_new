@@ -106,7 +106,10 @@ def _market_from_event(event: dict[str, Any]) -> Optional[Market]:
     tokens = {key: value for key, value in tokens.items() if value}
     if not tokens.get("up") or not tokens.get("down"):
         return None
-    texts.extend(market.get(key) for key in ("description", "question", "resolutionSource"))
+    texts.extend(
+        value for key in ("description", "question", "resolutionSource")
+        if (value := market.get(key)) is not None
+    )
     target = extract_target_price(texts)
     for value in (market.get("priceToBeat"), market.get("price_to_beat"), event.get("priceToBeat")):
         try:
@@ -269,7 +272,11 @@ def print_status(market: Optional[Market], prices: Prices) -> None:
     remaining = max(0.0, market.end.timestamp() - time.time())
     difference = ((prices.btc - market.target) / market.target * 100) if prices.btc and market.target else None
     difference_text = f"{difference:+.3f}%" if difference is not None else "n/a"
-    signal = "UP" if prices.btc is not None and market.target is not None and prices.btc >= market.target else "DOWN"
+    signal = (
+        "n/a"
+        if prices.btc is None or market.target is None
+        else "UP" if prices.btc >= market.target else "DOWN"
+    )
     print(
         f"{market.slug} | end {market.end.isoformat()} | {remaining:5.1f}s | "
         f"target {market.target or 'n/a'} | BTC {prices.btc or 'n/a'} | "
@@ -281,12 +288,14 @@ def print_status(market: Optional[Market], prices: Prices) -> None:
 
 async def main() -> None:
     prices, market_ref = Prices(), [None]
-    asyncio.create_task(PolymarketPriceClient(prices).run())
-    asyncio.create_task(ClobPriceClient(prices, market_ref).run())
+    tasks = [
+        asyncio.create_task(PolymarketPriceClient(prices).run()),
+        asyncio.create_task(ClobPriceClient(prices, market_ref).run()),
+    ]
     while True:
         try:
             market = await asyncio.to_thread(fetch_active_market)
-            if market_ref[0] is None or not market or market.slug != market_ref[0].slug:
+            if market is None or market_ref[0] is None or market.slug != market_ref[0].slug:
                 market_ref[0] = market
         except (requests.RequestException, ValueError, TypeError) as exc:
             print(f"Gamma API error: {exc}", flush=True)
