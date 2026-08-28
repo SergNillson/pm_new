@@ -276,7 +276,11 @@ class ClobPriceClient:
         ask_values = [price for price in (_price_from_level(x) for x in asks) if price is not None]
         bid = max(bid_values, default=None)
         ask = min(ask_values, default=None)
-        return (bid + ask) / 2 if bid is not None and ask is not None else bid or ask
+        return (
+            (bid + ask) / 2
+            if bid is not None and ask is not None
+            else bid if bid is not None else ask
+        )
 
 
 def print_status(market: Optional[Market], prices: Prices) -> None:
@@ -312,10 +316,8 @@ async def main() -> None:
 
     async def poll_market() -> None:
         while True:
-            market = market_ref[0]
             try:
-                market = await asyncio.to_thread(fetch_active_market)
-                market_ref[0] = market
+                market_ref[0] = await asyncio.to_thread(fetch_active_market)
             except (requests.RequestException, ValueError, TypeError) as exc:
                 print(f"Gamma API error: {exc}", flush=True)
             print_status(market_ref[0], prices)
@@ -336,9 +338,9 @@ async def main() -> None:
     btc_client = PolymarketPriceClient(prices)
     clob_client = ClobPriceClient(prices, market_ref)
     tasks = [
-        asyncio.create_task(supervise(btc_client.run, "BTC price")),
-        asyncio.create_task(supervise(clob_client.run, "CLOB")),
-        asyncio.create_task(supervise(poll_market, "Gamma")),
+        asyncio.create_task(supervise(lambda: btc_client.run(), "BTC price")),
+        asyncio.create_task(supervise(lambda: clob_client.run(), "CLOB")),
+        asyncio.create_task(supervise(lambda: poll_market(), "Gamma")),
     ]
     await asyncio.gather(*tasks)
 
